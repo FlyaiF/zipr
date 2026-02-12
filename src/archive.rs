@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +26,21 @@ pub struct ListedEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct DiffEntry {
+    pub path: String,
+    pub kind: DiffKind,
+    pub content_changed: bool,
+    pub metadata_changes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    Added,
+    Removed,
+    Modified,
+}
+
+#[derive(Debug, Clone)]
 pub struct DraftSummary {
     pub matched: usize,
     pub unresolved: usize,
@@ -42,6 +57,17 @@ struct EntryMeta {
     method: CompressionMethod,
     mtime: Option<DateTime>,
     unix_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct EntrySnapshot {
+    size: u64,
+    compressed_size: u64,
+    crc32: u32,
+    method: CompressionMethod,
+    mtime: Option<DateTime>,
+    unix_mode: Option<u32>,
+    comment: String,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +94,144 @@ pub fn list_recursive(path: &Path, config: &Config) -> Result<Vec<ListedEntry>> 
     let root = path.to_string_lossy().to_string();
     recurse_list(&mut archive, &root, config, &mut out)?;
     Ok(out)
+}
+
+pub fn diff_recursive(left: &Path, right: &Path, config: &Config) -> Result<Vec<DiffEntry>> {
+    let left_entries = snapshot_archive(left, config)?;
+    let right_entries = snapshot_archive(right, config)?;
+    let mut keys = BTreeSet::new();
+    keys.extend(left_entries.keys().cloned());
+    keys.extend(right_entries.keys().cloned());
+
+    let mut out = Vec::new();
+    for key in keys {
+        match (left_entries.get(&key), right_entries.get(&key)) {
+            (None, Some(_r)) => out.push(DiffEntry {
+                path: key,
+                kind: DiffKind::Added,
+                content_changed: true,
+                metadata_changes: vec![],
+            }),
+            (Some(_l), None) => out.push(DiffEntry {
+                path: key,
+                kind: DiffKind::Removed,
+                content_changed: true,
+                metadata_changes: vec![],
+            }),
+            (Some(l), Some(r)) => {
+                let content_changed = l.size != r.size || l.crc32 != r.crc32;
+                let metadata_changes = diff_metadata(l, r);
+                if content_changed || !metadata_changes.is_empty() {
+                    out.push(DiffEntry {
+                        path: key,
+                        kind: DiffKind::Modified,
+                        content_changed,
+                        metadata_changes,
+                    });
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(out)
+}
+
+fn snapshot_archive(path: &Path, config: &Config) -> Result<HashMap<String, EntrySnapshot>> {
+    let bytes = fs::read(path)?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    let mut out = HashMap::new();
+    snapshot_recursive(&mut archive, "", config, &mut out)?;
+    Ok(out)
+}
+
+fn snapshot_recursive<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    prefix: &str,
+    config: &Config,
+    out: &mut HashMap<String, EntrySnapshot>,
+) -> Result<()> {
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        if file.is_dir() {
+            continue;
+        }
+        let name = file.name().to_string();
+        let path = make_expr(prefix, &name);
+        out.insert(
+            path.clone(),
+            EntrySnapshot {
+                size: file.size(),
+                compressed_size: file.compressed_size(),
+                crc32: file.crc32(),
+                method: file.compression(),
+                mtime: file.last_modified(),
+                unix_mode: file.unix_mode(),
+                comment: file.comment().to_string(),
+            },
+        );
+
+        if config.is_archive_name(&name) {
+            let mut nested = Vec::new();
+            file.read_to_end(&mut nested)?;
+            if let Ok(mut nested_archive) = ZipArchive::new(Cursor::new(nested)) {
+                snapshot_recursive(&mut nested_archive, &path, config, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn diff_metadata(left: &EntrySnapshot, right: &EntrySnapshot) -> Vec<String> {
+    let mut changes = Vec::new();
+    if left.method != right.method {
+        changes.push(format!("method: {:?} -> {:?}", left.method, right.method));
+    }
+    if left.compressed_size != right.compressed_size {
+        changes.push(format!(
+            "compressed_size: {} -> {}",
+            left.compressed_size, right.compressed_size
+        ));
+    }
+    if left.unix_mode != right.unix_mode {
+        changes.push(format!(
+            "unix_mode: {} -> {}",
+            fmt_mode(left.unix_mode),
+            fmt_mode(right.unix_mode)
+        ));
+    }
+    if left.mtime != right.mtime {
+        changes.push(format!(
+            "mtime: {} -> {}",
+            fmt_time(left.mtime),
+            fmt_time(right.mtime)
+        ));
+    }
+    if left.comment != right.comment {
+        changes.push(format!(
+            "comment: {} -> {}",
+            quote_comment(&left.comment),
+            quote_comment(&right.comment)
+        ));
+    }
+    changes
+}
+
+fn fmt_mode(v: Option<u32>) -> String {
+    match v {
+        Some(x) => format!("0o{x:o}"),
+        None => "none".to_string(),
+    }
+}
+
+fn fmt_time(v: Option<DateTime>) -> String {
+    match v {
+        Some(x) => x.to_string(),
+        None => "none".to_string(),
+    }
+}
+
+fn quote_comment(v: &str) -> String {
+    format!("{v:?}")
 }
 
 fn recurse_list<R: Read + Seek>(

@@ -135,6 +135,82 @@ fn patch_draft_and_apply() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn diff_shows_added_removed_modified_and_metadata() -> Result<()> {
+    let dir = tempdir()?;
+    let left = dir.path().join("left.zip");
+    let right = dir.path().join("right.zip");
+
+    let mut nested_left_buf = Cursor::new(Vec::<u8>::new());
+    {
+        let mut nested = zip::ZipWriter::new(&mut nested_left_buf);
+        nested.start_file(
+            "same.txt",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+        )?;
+        nested.write_all(b"old-content")?;
+        nested.start_file(
+            "old-only.txt",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+        )?;
+        nested.write_all(b"left")?;
+        nested.finish()?;
+    }
+
+    let mut nested_right_buf = Cursor::new(Vec::<u8>::new());
+    {
+        let mut nested = zip::ZipWriter::new(&mut nested_right_buf);
+        nested.start_file(
+            "same.txt",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+        )?;
+        nested.write_all(b"new-content")?;
+        nested.start_file(
+            "new-only.txt",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+        )?;
+        nested.write_all(b"right")?;
+        nested.finish()?;
+    }
+
+    write_zip(
+        &left,
+        vec![
+            ("meta.txt", b"same".to_vec(), CompressionMethod::Deflated),
+            (
+                "nested.jar",
+                nested_left_buf.into_inner(),
+                CompressionMethod::Stored,
+            ),
+        ],
+    )?;
+    write_zip(
+        &right,
+        vec![
+            ("meta.txt", b"same".to_vec(), CompressionMethod::Stored),
+            (
+                "nested.jar",
+                nested_right_buf.into_inner(),
+                CompressionMethod::Stored,
+            ),
+        ],
+    )?;
+
+    let output = bin_cmd(dir.path())
+        .arg("diff")
+        .arg(&left)
+        .arg(&right)
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("M meta.txt"));
+    assert!(stdout.contains("meta: method: Deflated -> Stored"));
+    assert!(stdout.contains("M nested.jar!/same.txt"));
+    assert!(stdout.contains("A nested.jar!/new-only.txt"));
+    assert!(stdout.contains("D nested.jar!/old-only.txt"));
+    Ok(())
+}
+
 fn bin_cmd(cwd: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_zipr"));
     cmd.current_dir(cwd);

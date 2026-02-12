@@ -4,14 +4,21 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::archive::{self, ReplaceOptions};
+use crate::archive::{self, DiffKind, ReplaceOptions};
 use crate::config::Config;
 use crate::patch_spec::{LevelName, LevelPolicy, MethodPolicy, MtimePolicy};
 use crate::path_expr::parse_zip_expr;
 
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nrevision: ",
+    env!("ZIPR_GIT_REV")
+);
+
 #[derive(Debug, Parser)]
 #[command(name = "zipr")]
 #[command(about = "Recursive zip/jar/war inspector and patch tool")]
+#[command(version = env!("CARGO_PKG_VERSION"), long_version = LONG_VERSION)]
 pub struct Cli {
     #[arg(
         long,
@@ -42,10 +49,15 @@ enum Cmd {
         zip_expr: String,
         source: PathBuf,
     },
+    Diff {
+        left: PathBuf,
+        right: PathBuf,
+    },
     Patch {
         #[command(subcommand)]
         cmd: PatchCmd,
     },
+    Version,
 }
 
 #[derive(Debug, Subcommand)]
@@ -75,7 +87,9 @@ pub fn run() -> Result<()> {
         Some(Cmd::Get { zip_expr, out }) => run_get(&zip_expr, out.as_deref(), &config)?,
         Some(Cmd::Delete { zip_expr }) => run_delete(&zip_expr, &config)?,
         Some(Cmd::Replace { zip_expr, source }) => run_replace(&zip_expr, &source, &config)?,
+        Some(Cmd::Diff { left, right }) => run_diff(&left, &right, &config)?,
         Some(Cmd::Patch { cmd }) => run_patch(cmd, &config)?,
+        Some(Cmd::Version) => run_version(),
         None => {
             if let Some(archive) = cli.archive {
                 run_list(&archive, &config)?;
@@ -83,6 +97,11 @@ pub fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_version() {
+    println!("zipr {}", env!("CARGO_PKG_VERSION"));
+    println!("revision {}", env!("ZIPR_GIT_REV"));
 }
 
 fn run_list(archive: &Path, config: &Config) -> Result<()> {
@@ -122,6 +141,49 @@ fn run_replace(expr: &str, source: &Path, config: &Config) -> Result<()> {
         mtime: MtimePolicy::Source,
     };
     archive::replace(&parsed, source, config, opts)
+}
+
+fn run_diff(left: &Path, right: &Path, config: &Config) -> Result<()> {
+    let items = archive::diff_recursive(left, right, config)?;
+    if items.is_empty() {
+        println!("No differences.");
+        return Ok(());
+    }
+
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut modified = 0usize;
+
+    for item in &items {
+        let tag = match item.kind {
+            DiffKind::Added => {
+                added += 1;
+                "A"
+            }
+            DiffKind::Removed => {
+                removed += 1;
+                "D"
+            }
+            DiffKind::Modified => {
+                modified += 1;
+                "M"
+            }
+        };
+        println!("{tag} {}", item.path);
+        if item.kind == DiffKind::Modified {
+            if item.content_changed {
+                println!("  content: changed");
+            }
+            for c in &item.metadata_changes {
+                println!("  meta: {c}");
+            }
+        }
+    }
+    println!(
+        "Summary: added={}, removed={}, modified={}",
+        added, removed, modified
+    );
+    Ok(())
 }
 
 fn run_patch(cmd: PatchCmd, config: &Config) -> Result<()> {
