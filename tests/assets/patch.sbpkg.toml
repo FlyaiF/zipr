@@ -1,0 +1,37 @@
+version = 1
+
+[[entry]]
+target = "BOOT-INF/classes/com/example/sbpkg/FirstPrinter.class"
+source = "tests/assets/FirstPrinter.class"
+action = "replace"
+method = "inherit"
+level = "inherit"
+mtime = "source"
+comment = "inherit"
+
+[[entry]]
+target = "BOOT-INF/lib/sb-modulea-0.0.1-SNAPSHOT.jar!/com/example/sbpkg/modulea/PrintFromProperties.class"
+source = "tests/assets/PrintFromProperties.class"
+action = "replace"
+method = "inherit"
+level = "inherit"
+mtime = "source"
+comment = "inherit"
+
+[[entry]]
+target = "BOOT-INF/lib/sb-moduleb-0.0.1-SNAPSHOT.jar!/com/example/sbpkg/moduleb/PrintFromModule.class"
+source = "tests/assets/PrintFromModule.class"
+action = "replace"
+method = "inherit"
+level = "inherit"
+mtime = "source"
+comment = "inherit"
+
+[[entry]]
+target = "BOOT-INF/lib/sb-modulea-0.0.1-SNAPSHOT.jar!/print.properties"
+source = "tests/assets/print.properties"
+action = "replace"
+method = "inherit"
+level = "inherit"
+mtime = "source"
+comment = "inherit"

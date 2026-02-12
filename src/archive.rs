@@ -1,0 +1,515 @@
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{Cursor, Read, Seek, Write};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use anyhow::{Context, Result, anyhow, bail};
+use tempfile::Builder;
+use time::OffsetDateTime;
+use walkdir::WalkDir;
+use zip::read::ZipArchive;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, DateTime, ZipWriter};
+
+use crate::config::Config;
+use crate::patch_spec::{
+    Action, LevelName, LevelPolicy, MethodPolicy, MtimePolicy, PatchEntry, PatchSpec, Unresolved,
+};
+use crate::path_expr::{ZipExpr, make_expr, normalize_path_for_zip, parse_zip_expr};
+
+#[derive(Debug, Clone)]
+pub struct ListedEntry {
+    pub expr: String,
+    pub size: u64,
+    pub compressed_size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DraftSummary {
+    pub matched: usize,
+    pub unresolved: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplySummary {
+    pub replaced: usize,
+    pub deleted: usize,
+}
+
+#[derive(Debug, Clone)]
+struct EntryMeta {
+    method: CompressionMethod,
+    mtime: Option<DateTime>,
+    unix_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplaceOptions {
+    pub method: MethodPolicy,
+    pub level: LevelPolicy,
+    pub mtime: MtimePolicy,
+}
+
+impl Default for ReplaceOptions {
+    fn default() -> Self {
+        Self {
+            method: MethodPolicy::Inherit,
+            level: LevelPolicy::Name(LevelName::Inherit),
+            mtime: MtimePolicy::Source,
+        }
+    }
+}
+
+pub fn list_recursive(path: &Path, config: &Config) -> Result<Vec<ListedEntry>> {
+    let file = File::open(path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut out = Vec::new();
+    let root = path.to_string_lossy().to_string();
+    recurse_list(&mut archive, &root, config, &mut out)?;
+    Ok(out)
+}
+
+fn recurse_list<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    prefix: &str,
+    config: &Config,
+    out: &mut Vec<ListedEntry>,
+) -> Result<()> {
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        if file.is_dir() {
+            continue;
+        }
+        let name = file.name().to_string();
+        let expr = make_expr(prefix, &name);
+        out.push(ListedEntry {
+            expr: expr.clone(),
+            size: file.size(),
+            compressed_size: file.compressed_size(),
+        });
+
+        if config.is_archive_name(&name) {
+            let mut nested = Vec::new();
+            file.read_to_end(&mut nested)?;
+            if let Ok(mut nested_archive) = ZipArchive::new(Cursor::new(nested)) {
+                recurse_list(&mut nested_archive, &expr, config, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn get(expr: &ZipExpr, config: &Config) -> Result<Vec<u8>> {
+    let mut bytes = fs::read(&expr.root_archive)?;
+    for seg in expr.archive_chain() {
+        let inner = read_from_bytes(&bytes, seg)
+            .with_context(|| format!("archive segment `{seg}` not found in nested chain"))?;
+        if !config.is_archive_name(seg) {
+            bail!("segment `{seg}` is not recognized as an archive extension");
+        }
+        bytes = inner;
+    }
+    read_from_bytes(&bytes, expr.target()?).with_context(|| "target entry not found".to_string())
+}
+
+pub fn delete(expr: &ZipExpr, config: &Config) -> Result<()> {
+    let source_bytes = fs::read(&expr.root_archive)?;
+    let (next, changed) =
+        mutate_archive_bytes(&source_bytes, &expr.segments, Mutation::Delete, config)?;
+    if !changed {
+        bail!("target entry not found: {}", expr.target()?);
+    }
+    write_atomically(&expr.root_archive, &next)
+}
+
+pub fn replace(expr: &ZipExpr, source: &Path, config: &Config, opts: ReplaceOptions) -> Result<()> {
+    let source_bytes = fs::read(source)?;
+    let source_meta = fs::metadata(source).ok();
+    let source_mtime = source_meta.and_then(|m| m.modified().ok());
+    let mutation = Mutation::Replace {
+        bytes: source_bytes,
+        opts,
+        source_mtime,
+    };
+    let original = fs::read(&expr.root_archive)?;
+    let (next, changed) = mutate_archive_bytes(&original, &expr.segments, mutation, config)?;
+    if !changed {
+        bail!("target entry not found: {}", expr.target()?);
+    }
+    write_atomically(&expr.root_archive, &next)
+}
+
+pub fn patch_draft(
+    archive_path: &Path,
+    source_dir: &Path,
+    output: &Path,
+    config: &Config,
+) -> Result<DraftSummary> {
+    let listed = list_recursive(archive_path, config)?;
+    let mut by_full = HashMap::<String, String>::new();
+    let mut by_name = HashMap::<String, Vec<String>>::new();
+    for item in &listed {
+        let mut parts = item.expr.split("!/");
+        let _root = parts.next();
+        let rel = parts.collect::<Vec<_>>().join("!/");
+        if rel.is_empty() {
+            continue;
+        }
+        by_full.insert(rel.clone(), item.expr.clone());
+        let base = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        by_name.entry(base).or_default().push(item.expr.clone());
+    }
+
+    let mut entry = Vec::new();
+    let mut unresolved = Vec::new();
+
+    for d in WalkDir::new(source_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+    {
+        let src_path = d.path();
+        let rel = src_path.strip_prefix(source_dir).unwrap_or(src_path);
+        let rel_norm = normalize_path_for_zip(rel);
+        let src_norm = normalize_path_for_zip(src_path);
+
+        if let Some(target) = by_full.get(&rel_norm) {
+            entry.push(PatchEntry {
+                target: target.clone(),
+                source: Some(src_norm),
+                action: Action::Replace,
+                method: MethodPolicy::Inherit,
+                level: LevelPolicy::Name(LevelName::Inherit),
+                mtime: MtimePolicy::Source,
+                comment: crate::patch_spec::CommentPolicy::Inherit,
+            });
+            continue;
+        }
+
+        let base = rel
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if let Some(cands) = by_name.get(&base) {
+            if cands.len() == 1 {
+                entry.push(PatchEntry {
+                    target: cands[0].clone(),
+                    source: Some(src_norm),
+                    action: Action::Replace,
+                    method: MethodPolicy::Inherit,
+                    level: LevelPolicy::Name(LevelName::Inherit),
+                    mtime: MtimePolicy::Source,
+                    comment: crate::patch_spec::CommentPolicy::Inherit,
+                });
+            } else {
+                unresolved.push(Unresolved {
+                    source: src_norm,
+                    reason: "multiple targets".to_string(),
+                    candidates: cands.clone(),
+                });
+            }
+            continue;
+        }
+
+        unresolved.push(Unresolved {
+            source: src_norm,
+            reason: "no target matched".to_string(),
+            candidates: vec![],
+        });
+    }
+
+    let spec = PatchSpec {
+        version: 1,
+        archive: Some(normalize_path_for_zip(archive_path)),
+        generated_at: Some(format!("{:?}", SystemTime::now())),
+        entry,
+        unresolved,
+    };
+    spec.write_to_file(output)?;
+
+    Ok(DraftSummary {
+        matched: spec.entry.len(),
+        unresolved: spec.unresolved.len(),
+    })
+}
+
+pub fn patch_apply(
+    archive_path: &Path,
+    spec_path: &Path,
+    dry_run: bool,
+    config: &Config,
+) -> Result<ApplySummary> {
+    let spec = PatchSpec::read_from_file(spec_path)?;
+    let mut current = fs::read(archive_path)?;
+    let mut summary = ApplySummary {
+        replaced: 0,
+        deleted: 0,
+    };
+
+    for e in &spec.entry {
+        let expr = parse_zip_expr(&format!(
+            "{}!/{target}",
+            normalize_path_for_zip(archive_path),
+            target = strip_root_from_target(&e.target)
+        ))?;
+
+        match e.action {
+            Action::Delete => {
+                let (next, changed) =
+                    mutate_archive_bytes(&current, &expr.segments, Mutation::Delete, config)?;
+                if !changed {
+                    bail!("target not found during delete: {}", e.target);
+                }
+                current = next;
+                summary.deleted += 1;
+            }
+            Action::Replace => {
+                let source = e
+                    .source
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("replace entry missing source: {}", e.target))?;
+                let bytes = fs::read(source)
+                    .with_context(|| format!("failed to read source file `{source}` for patch"))?;
+                let source_mtime = fs::metadata(source).ok().and_then(|m| m.modified().ok());
+                let opts = ReplaceOptions {
+                    method: e.method.clone(),
+                    level: e.level.clone(),
+                    mtime: e.mtime.clone(),
+                };
+                let (next, changed) = mutate_archive_bytes(
+                    &current,
+                    &expr.segments,
+                    Mutation::Replace {
+                        bytes,
+                        opts,
+                        source_mtime,
+                    },
+                    config,
+                )?;
+                if !changed {
+                    bail!("target not found during replace: {}", e.target);
+                }
+                current = next;
+                summary.replaced += 1;
+            }
+        }
+    }
+
+    if !dry_run {
+        write_atomically(archive_path, &current)?;
+    }
+    Ok(summary)
+}
+
+fn strip_root_from_target(target: &str) -> String {
+    if let Some((_, tail)) = target.split_once("!/") {
+        tail.to_string()
+    } else {
+        target.to_string()
+    }
+}
+
+enum Mutation {
+    Delete,
+    Replace {
+        bytes: Vec<u8>,
+        opts: ReplaceOptions,
+        source_mtime: Option<SystemTime>,
+    },
+}
+
+fn mutate_archive_bytes(
+    source: &[u8],
+    segments: &[String],
+    mutation: Mutation,
+    config: &Config,
+) -> Result<(Vec<u8>, bool)> {
+    if segments.is_empty() {
+        bail!("empty path segments");
+    }
+
+    let mut src_archive = ZipArchive::new(Cursor::new(source))?;
+    let out_cursor = Cursor::new(Vec::<u8>::new());
+    let mut writer = ZipWriter::new(out_cursor);
+
+    let mut changed = false;
+    let target = &segments[0];
+
+    for i in 0..src_archive.len() {
+        let mut file = src_archive.by_index(i)?;
+        let name = file.name().to_string();
+        let file_meta = EntryMeta {
+            method: file.compression(),
+            mtime: file.last_modified(),
+            unix_mode: file.unix_mode(),
+        };
+
+        if name != *target {
+            writer.raw_copy_file(file)?;
+            continue;
+        }
+
+        if segments.len() > 1 {
+            if !config.is_archive_name(&name) {
+                bail!("segment `{name}` is not an archive but nested path continues");
+            }
+            let mut nested_bytes = Vec::new();
+            file.read_to_end(&mut nested_bytes)?;
+            let (next_nested, nested_changed) = mutate_archive_bytes(
+                &nested_bytes,
+                &segments[1..],
+                mutation_for_nested(&mutation),
+                config,
+            )?;
+            changed |= nested_changed;
+            if nested_changed {
+                let nested_meta = file_meta;
+                copy_new_entry(
+                    &mut writer,
+                    &name,
+                    &next_nested,
+                    nested_meta,
+                    &ReplaceOptions::default(),
+                    file.last_modified(),
+                )?;
+            } else {
+                writer.raw_copy_file(file)?;
+            }
+            continue;
+        }
+
+        match &mutation {
+            Mutation::Delete => {
+                changed = true;
+            }
+            Mutation::Replace {
+                bytes,
+                opts,
+                source_mtime,
+            } => {
+                changed = true;
+                copy_new_entry(
+                    &mut writer,
+                    &name,
+                    bytes,
+                    file_meta,
+                    opts,
+                    source_mtime.and_then(to_zip_time),
+                )?;
+            }
+        }
+    }
+
+    let cursor = writer.finish()?;
+    Ok((cursor.into_inner(), changed))
+}
+
+fn mutation_for_nested(m: &Mutation) -> Mutation {
+    match m {
+        Mutation::Delete => Mutation::Delete,
+        Mutation::Replace {
+            bytes,
+            opts,
+            source_mtime,
+        } => Mutation::Replace {
+            bytes: bytes.clone(),
+            opts: opts.clone(),
+            source_mtime: *source_mtime,
+        },
+    }
+}
+
+fn copy_new_entry(
+    writer: &mut ZipWriter<Cursor<Vec<u8>>>,
+    name: &str,
+    data: &[u8],
+    original: EntryMeta,
+    opts: &ReplaceOptions,
+    source_time: Option<DateTime>,
+) -> Result<()> {
+    let method = resolve_method(&original, opts);
+    let level = resolve_level(method, &opts.level, original.method);
+    let mut file_opts = SimpleFileOptions::default().compression_method(method);
+    if let Some(level) = level {
+        file_opts = file_opts.compression_level(Some(i64::from(level)));
+    }
+    if let Some(mode) = original.unix_mode {
+        file_opts = file_opts.unix_permissions(mode);
+    }
+
+    let mtime = match opts.mtime {
+        MtimePolicy::Keep => original.mtime,
+        MtimePolicy::Source => source_time.or(original.mtime),
+        MtimePolicy::Now => to_zip_time(SystemTime::now()).or(original.mtime),
+    };
+    if let Some(t) = mtime {
+        file_opts = file_opts.last_modified_time(t);
+    }
+
+    writer.start_file(name, file_opts)?;
+    if method == CompressionMethod::Stored {
+        let _ = crc32fast::hash(data);
+    }
+    writer.write_all(data)?;
+    Ok(())
+}
+
+fn resolve_method(original: &EntryMeta, opts: &ReplaceOptions) -> CompressionMethod {
+    match opts.method {
+        MethodPolicy::Inherit => original.method,
+        MethodPolicy::Stored => CompressionMethod::Stored,
+        MethodPolicy::Deflated => CompressionMethod::Deflated,
+    }
+}
+
+fn resolve_level(
+    method: CompressionMethod,
+    level_policy: &LevelPolicy,
+    original: CompressionMethod,
+) -> Option<u8> {
+    if method == CompressionMethod::Stored {
+        return None;
+    }
+    match level_policy {
+        LevelPolicy::Fixed(v) => Some(*v),
+        LevelPolicy::Name(LevelName::Default) => None,
+        LevelPolicy::Name(LevelName::Inherit) => {
+            if original == CompressionMethod::Stored {
+                None
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn read_from_bytes(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
+    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    let mut file = archive
+        .by_name(name)
+        .with_context(|| format!("entry `{name}` not found"))?;
+    let mut out = Vec::new();
+    file.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_dir = parent.join(".zipr-tmp");
+    fs::create_dir_all(&tmp_dir)?;
+    let mut tf = Builder::new()
+        .prefix("zipr-")
+        .suffix(".tmp")
+        .tempfile_in(&tmp_dir)?;
+    tf.write_all(bytes)?;
+    tf.flush()?;
+    let persisted: PathBuf = tf.into_temp_path().keep()?;
+    fs::rename(&persisted, path)?;
+    Ok(())
+}
+
+fn to_zip_time(st: SystemTime) -> Option<DateTime> {
+    let odt: OffsetDateTime = st.into();
+    DateTime::try_from(odt).ok()
+}
