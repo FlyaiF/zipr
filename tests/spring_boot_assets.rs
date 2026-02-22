@@ -31,12 +31,7 @@ fn sbpkg_replace_and_run_on_java17_plus() -> Result<()> {
     let mod_a_before = entry_method(&jar, &[MODULE_A_JAR], MODULE_A_CLASS)?;
     let mod_b_before = entry_method(&jar, &[MODULE_B_JAR], MODULE_B_CLASS)?;
 
-    run_zipr_replace(
-        dir.path(),
-        &jar,
-        FIRST_CLASS,
-        &asset("FirstPrinter.class"),
-    )?;
+    run_zipr_replace(dir.path(), &jar, FIRST_CLASS, &asset("FirstPrinter.class"))?;
     run_zipr_replace(
         dir.path(),
         &jar,
@@ -61,21 +56,36 @@ fn sbpkg_replace_and_run_on_java17_plus() -> Result<()> {
         fs::read(asset("FirstPrinter.class"))?
     );
     assert_eq!(
-        run_zipr_get(dir.path(), &expr(&jar, &format!("{MODULE_A_JAR}!/{MODULE_A_CLASS}")))?,
+        run_zipr_get(
+            dir.path(),
+            &expr(&jar, &format!("{MODULE_A_JAR}!/{MODULE_A_CLASS}"))
+        )?,
         fs::read(asset("PrintFromProperties.class"))?
     );
     assert_eq!(
-        run_zipr_get(dir.path(), &expr(&jar, &format!("{MODULE_B_JAR}!/{MODULE_B_CLASS}")))?,
+        run_zipr_get(
+            dir.path(),
+            &expr(&jar, &format!("{MODULE_B_JAR}!/{MODULE_B_CLASS}"))
+        )?,
         fs::read(asset("PrintFromModule.class"))?
     );
     assert_eq!(
-        run_zipr_get(dir.path(), &expr(&jar, &format!("{MODULE_A_JAR}!/{MODULE_A_PROP}")))?,
+        run_zipr_get(
+            dir.path(),
+            &expr(&jar, &format!("{MODULE_A_JAR}!/{MODULE_A_PROP}"))
+        )?,
         fs::read(asset("print.properties"))?
     );
 
     assert_eq!(entry_method(&jar, &[], FIRST_CLASS)?, first_before);
-    assert_eq!(entry_method(&jar, &[MODULE_A_JAR], MODULE_A_CLASS)?, mod_a_before);
-    assert_eq!(entry_method(&jar, &[MODULE_B_JAR], MODULE_B_CLASS)?, mod_b_before);
+    assert_eq!(
+        entry_method(&jar, &[MODULE_A_JAR], MODULE_A_CLASS)?,
+        mod_a_before
+    );
+    assert_eq!(
+        entry_method(&jar, &[MODULE_B_JAR], MODULE_B_CLASS)?,
+        mod_b_before
+    );
 
     let run_output = run_java_jar_with_timeout(&jar, Duration::from_secs(25))?;
     assert!(run_output.contains(":: printSelf modified."));
@@ -182,13 +192,12 @@ fn parse_java_major(s: &str) -> Option<u32> {
 
 fn run_zipr_replace(cwd: &Path, jar: &Path, target: &str, src: &Path) -> Result<()> {
     let expr = expr(jar, target);
-    let out = bin_cmd(cwd)
-        .arg("replace")
-        .arg(&expr)
-        .arg(src)
-        .output()?;
+    let out = bin_cmd(cwd).arg("replace").arg(&expr).arg(src).output()?;
     if !out.status.success() {
-        bail!("replace failed for {expr}: {}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "replace failed for {expr}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }
@@ -196,7 +205,10 @@ fn run_zipr_replace(cwd: &Path, jar: &Path, target: &str, src: &Path) -> Result<
 fn run_zipr_get(cwd: &Path, expr: &str) -> Result<Vec<u8>> {
     let out = bin_cmd(cwd).arg("get").arg(expr).output()?;
     if !out.status.success() {
-        bail!("get failed for {expr}: {}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "get failed for {expr}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(out.stdout)
 }

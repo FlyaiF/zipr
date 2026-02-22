@@ -3,9 +3,9 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use filetime::{FileTime, set_file_mtime};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tempfile::tempdir;
 use zip::CompressionMethod;
 use zip::DateTime;
@@ -208,6 +208,82 @@ fn diff_shows_added_removed_modified_and_metadata() -> Result<()> {
     assert!(stdout.contains("M nested.jar!/same.txt"));
     assert!(stdout.contains("A nested.jar!/new-only.txt"));
     assert!(stdout.contains("D nested.jar!/old-only.txt"));
+    Ok(())
+}
+
+fn build_conflict_archive(path: &Path) -> Result<()> {
+    write_zip(
+        path,
+        vec![
+            ("x/a.txt", b"left".to_vec(), CompressionMethod::Deflated),
+            ("y/a.txt", b"right".to_vec(), CompressionMethod::Deflated),
+        ],
+    )
+}
+
+#[test]
+fn fuzzy_replace_two_args_auto_applies_when_unambiguous() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("outer.zip");
+    build_nested_archive(&archive)?;
+
+    let replacement = dir.path().join("a.txt");
+    fs::write(&replacement, b"fuzzy-new")?;
+
+    let output = bin_cmd(dir.path())
+        .arg(&archive)
+        .arg(&replacement)
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("applied: replaced=1"));
+
+    let expr = format!("{}!/inner.jar!/a.txt", archive.display());
+    let get = bin_cmd(dir.path()).arg("get").arg(&expr).output()?;
+    assert!(get.status.success());
+    assert_eq!(get.stdout, b"fuzzy-new");
+    Ok(())
+}
+
+#[test]
+fn fuzzy_replace_two_args_prompts_on_conflict() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("conflict.zip");
+    build_conflict_archive(&archive)?;
+
+    let replacement = dir.path().join("a.txt");
+    fs::write(&replacement, b"new")?;
+
+    let mut child = bin_cmd(dir.path());
+    child
+        .arg(&archive)
+        .arg(&replacement)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child.spawn()?;
+    child.stdin.as_mut().context("stdin")?.write_all(b"n\n")?;
+    let output = child.wait_with_output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("Unresolved"));
+    assert!(stdout.contains("Aborted"));
+    assert!(stdout.contains("zipr patch apply"));
+
+    let expr = format!("{}!/x/a.txt", archive.display());
+    let get = bin_cmd(dir.path()).arg("get").arg(&expr).output()?;
+    assert!(get.status.success());
+    assert_eq!(get.stdout, b"left");
+    Ok(())
+}
+
+#[test]
+fn no_args_shows_help_and_fails() -> Result<()> {
+    let dir = tempdir()?;
+    let output = bin_cmd(dir.path()).output()?;
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.to_ascii_lowercase().contains("usage"));
     Ok(())
 }
 

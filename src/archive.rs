@@ -19,6 +19,13 @@ use crate::patch_spec::{
 use crate::path_expr::{ZipExpr, make_expr, normalize_path_for_zip, parse_zip_expr};
 
 #[derive(Debug, Clone)]
+struct DraftInput {
+    source_norm: String,
+    rel_norm: String,
+    base: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ListedEntry {
     pub expr: String,
     pub size: u64,
@@ -310,92 +317,10 @@ pub fn patch_draft(
     output: &Path,
     config: &Config,
 ) -> Result<DraftSummary> {
-    let listed = list_recursive(archive_path, config)?;
-    let mut by_full = HashMap::<String, String>::new();
-    let mut by_name = HashMap::<String, Vec<String>>::new();
-    for item in &listed {
-        let mut parts = item.expr.split("!/");
-        let _root = parts.next();
-        let rel = parts.collect::<Vec<_>>().join("!/");
-        if rel.is_empty() {
-            continue;
-        }
-        by_full.insert(rel.clone(), item.expr.clone());
-        let base = rel.rsplit('/').next().unwrap_or(&rel).to_string();
-        by_name.entry(base).or_default().push(item.expr.clone());
-    }
-
-    let mut entry = Vec::new();
-    let mut unresolved = Vec::new();
-
-    for d in WalkDir::new(source_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-    {
-        let src_path = d.path();
-        let rel = src_path.strip_prefix(source_dir).unwrap_or(src_path);
-        let rel_norm = normalize_path_for_zip(rel);
-        let src_norm = normalize_path_for_zip(src_path);
-
-        if let Some(target) = by_full.get(&rel_norm) {
-            entry.push(PatchEntry {
-                target: target.clone(),
-                source: Some(src_norm),
-                action: Action::Replace,
-                method: MethodPolicy::Inherit,
-                level: LevelPolicy::Name(LevelName::Inherit),
-                mtime: MtimePolicy::Source,
-                comment: crate::patch_spec::CommentPolicy::Inherit,
-            });
-            continue;
-        }
-
-        let base = rel
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if let Some(cands) = by_name.get(&base) {
-            if cands.len() == 1 {
-                entry.push(PatchEntry {
-                    target: cands[0].clone(),
-                    source: Some(src_norm),
-                    action: Action::Replace,
-                    method: MethodPolicy::Inherit,
-                    level: LevelPolicy::Name(LevelName::Inherit),
-                    mtime: MtimePolicy::Source,
-                    comment: crate::patch_spec::CommentPolicy::Inherit,
-                });
-            } else {
-                unresolved.push(Unresolved {
-                    source: src_norm,
-                    reason: "multiple targets".to_string(),
-                    candidates: cands.clone(),
-                });
-            }
-            continue;
-        }
-
-        unresolved.push(Unresolved {
-            source: src_norm,
-            reason: "no target matched".to_string(),
-            candidates: vec![],
-        });
-    }
-
-    let spec = PatchSpec {
-        version: 1,
-        archive: Some(normalize_path_for_zip(archive_path)),
-        generated_at: Some(format!("{:?}", SystemTime::now())),
-        entry,
-        unresolved,
-    };
+    let inputs = collect_inputs(source_dir)?;
+    let (spec, summary) = build_patch_spec(archive_path, inputs, config)?;
     spec.write_to_file(output)?;
-
-    Ok(DraftSummary {
-        matched: spec.entry.len(),
-        unresolved: spec.unresolved.len(),
-    })
+    Ok(summary)
 }
 
 pub fn patch_apply(
@@ -405,6 +330,15 @@ pub fn patch_apply(
     config: &Config,
 ) -> Result<ApplySummary> {
     let spec = PatchSpec::read_from_file(spec_path)?;
+    patch_apply_spec(archive_path, &spec, dry_run, config)
+}
+
+pub fn patch_apply_spec(
+    archive_path: &Path,
+    spec: &PatchSpec,
+    dry_run: bool,
+    config: &Config,
+) -> Result<ApplySummary> {
     let mut current = fs::read(archive_path)?;
     let mut summary = ApplySummary {
         replaced: 0,
@@ -464,6 +398,138 @@ pub fn patch_apply(
         write_atomically(archive_path, &current)?;
     }
     Ok(summary)
+}
+
+fn build_patch_spec(
+    archive_path: &Path,
+    inputs: Vec<DraftInput>,
+    config: &Config,
+) -> Result<(PatchSpec, DraftSummary)> {
+    let listed = list_recursive(archive_path, config)?;
+    let mut by_full = HashMap::<String, String>::new();
+    let mut by_name = HashMap::<String, Vec<String>>::new();
+    for item in &listed {
+        let mut parts = item.expr.split("!/");
+        let _root = parts.next();
+        let rel = parts.collect::<Vec<_>>().join("!/");
+        if rel.is_empty() {
+            continue;
+        }
+        by_full.insert(rel.clone(), item.expr.clone());
+        let base = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        by_name.entry(base).or_default().push(item.expr.clone());
+    }
+
+    let mut entry = Vec::new();
+    let mut unresolved = Vec::new();
+    for input in inputs {
+        if let Some(target) = by_full.get(&input.rel_norm) {
+            entry.push(PatchEntry {
+                target: target.clone(),
+                source: Some(input.source_norm.clone()),
+                action: Action::Replace,
+                method: MethodPolicy::Inherit,
+                level: LevelPolicy::Name(LevelName::Inherit),
+                mtime: MtimePolicy::Source,
+                comment: crate::patch_spec::CommentPolicy::Inherit,
+            });
+            continue;
+        }
+
+        if let Some(cands) = by_name.get(&input.base) {
+            if cands.len() == 1 {
+                entry.push(PatchEntry {
+                    target: cands[0].clone(),
+                    source: Some(input.source_norm.clone()),
+                    action: Action::Replace,
+                    method: MethodPolicy::Inherit,
+                    level: LevelPolicy::Name(LevelName::Inherit),
+                    mtime: MtimePolicy::Source,
+                    comment: crate::patch_spec::CommentPolicy::Inherit,
+                });
+            } else {
+                unresolved.push(Unresolved {
+                    source: input.source_norm.clone(),
+                    reason: "multiple targets".to_string(),
+                    candidates: cands.clone(),
+                });
+            }
+            continue;
+        }
+
+        unresolved.push(Unresolved {
+            source: input.source_norm.clone(),
+            reason: "no target matched".to_string(),
+            candidates: vec![],
+        });
+    }
+
+    let spec = PatchSpec {
+        version: 1,
+        archive: Some(normalize_path_for_zip(archive_path)),
+        generated_at: Some(format!("{:?}", SystemTime::now())),
+        entry,
+        unresolved,
+    };
+    let summary = DraftSummary {
+        matched: spec.entry.len(),
+        unresolved: spec.unresolved.len(),
+    };
+    Ok((spec, summary))
+}
+
+pub fn draft_from_path(
+    archive_path: &Path,
+    source: &Path,
+    config: &Config,
+) -> Result<(PatchSpec, DraftSummary)> {
+    let inputs = collect_inputs(source)?;
+    build_patch_spec(archive_path, inputs, config)
+}
+
+fn collect_inputs(source: &Path) -> Result<Vec<DraftInput>> {
+    if source.is_dir() {
+        let mut out = Vec::new();
+        for d in WalkDir::new(source)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+        {
+            let src_path = d.path();
+            let rel = src_path.strip_prefix(source).unwrap_or(src_path);
+            let rel_norm = normalize_path_for_zip(rel);
+            let src_norm = normalize_path_for_zip(src_path);
+            let base = rel
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            out.push(DraftInput {
+                source_norm: src_norm,
+                rel_norm,
+                base,
+            });
+        }
+        return Ok(out);
+    }
+
+    if source.is_file() {
+        let src_norm = normalize_path_for_zip(source);
+        let base = source
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| src_norm.clone());
+        let rel_norm = source
+            .file_name()
+            .map(|n| normalize_path_for_zip(Path::new(&n)))
+            .unwrap_or_else(|| src_norm.clone());
+        return Ok(vec![DraftInput {
+            source_norm: src_norm,
+            rel_norm,
+            base,
+        }]);
+    }
+
+    bail!("source path does not exist: {}", source.display());
 }
 
 fn strip_root_from_target(target: &str) -> String {

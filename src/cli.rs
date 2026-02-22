@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::archive::{self, DiffKind, ReplaceOptions};
 use crate::config::Config;
@@ -28,8 +29,10 @@ pub struct Cli {
     archive_ext: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
-    #[arg(help = "Archive path for default list mode")]
+    #[arg(help = "Archive path for default list/fuzzy mode")]
     archive: Option<PathBuf>,
+    #[arg(help = "Source file or directory for fuzzy replace mode")]
+    source: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -90,13 +93,20 @@ pub fn run() -> Result<()> {
         Some(Cmd::Diff { left, right }) => run_diff(&left, &right, &config)?,
         Some(Cmd::Patch { cmd }) => run_patch(cmd, &config)?,
         Some(Cmd::Version) => run_version(),
-        None => {
-            if let Some(archive) = cli.archive {
-                run_list(&archive, &config)?;
-            }
-        }
+        None => match (cli.archive, cli.source) {
+            (Some(archive), Some(source)) => run_fuzzy_replace(&archive, &source, &config)?,
+            (Some(archive), None) => run_list(&archive, &config)?,
+            _ => return print_help_and_fail(),
+        },
     }
     Ok(())
+}
+
+fn print_help_and_fail() -> Result<()> {
+    let mut cmd = Cli::command();
+    cmd.print_help()?;
+    eprintln!();
+    Err(anyhow!("no command provided"))
 }
 
 fn run_version() {
@@ -182,6 +192,65 @@ fn run_diff(left: &Path, right: &Path, config: &Config) -> Result<()> {
     println!(
         "Summary: added={}, removed={}, modified={}",
         added, removed, modified
+    );
+    Ok(())
+}
+
+fn run_fuzzy_replace(archive: &Path, source: &Path, config: &Config) -> Result<()> {
+    if !archive.exists() {
+        bail!("archive not found: {}", archive.display());
+    }
+    if !archive.is_file() {
+        bail!("archive is not a file: {}", archive.display());
+    }
+    if let Some(ext) = archive.extension().and_then(|s| s.to_str()) {
+        if !config.is_archive_name(ext) {
+            bail!("archive extension not recognized: {}", archive.display());
+        }
+    } else {
+        bail!("archive has no extension: {}", archive.display());
+    }
+
+    let (spec, draft) = archive::draft_from_path(archive, source, config)
+        .with_context(|| "failed to build fuzzy manifest")?;
+
+    if draft.unresolved > 0 {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let manifest_path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(format!("zipr-fuzzy-{ts}.toml"));
+        spec.write_to_file(&manifest_path)?;
+        println!(
+            "Unresolved matches detected (matched={}, unresolved={}). Review manifest below:",
+            draft.matched, draft.unresolved
+        );
+        let raw = toml::to_string_pretty(&spec)?;
+        println!("{raw}");
+        println!("Manifest saved to: {}", manifest_path.display());
+        println!(
+            "You can apply later via: zipr patch apply {} --spec {}",
+            archive.display(),
+            manifest_path.display()
+        );
+        print!("Apply matched changes? [y/N] ");
+        use std::io::{self, Write};
+        io::stdout().flush().ok();
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf)?;
+        let decision = buf.trim().to_ascii_lowercase();
+        if decision != "y" && decision != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let summary = archive::patch_apply_spec(archive, &spec, false, config)?;
+    println!(
+        "applied: replaced={}, deleted={}",
+        summary.replaced, summary.deleted
     );
     Ok(())
 }

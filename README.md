@@ -6,14 +6,31 @@ cargo build
 cargo run -- --help
 ```
 
-## 2. 基本命令
+## 2. 默认入口（最常用）
 
-### 递归列出（默认）
+- 双参模糊替换：`zipr <archive> <file|dir>`
+- 单参递归列出：`zipr <archive>`
+
+### 双参模糊替换（默认优先）
+传入压缩包路径 + 本地文件/目录时，自动生成并应用模糊匹配的替换清单：
+```bash
+# 单文件：匹配同名/同路径目标并直接替换
+cargo run -- tests/assets/sb-pkg.jar patches/a.txt
+
+# 目录：递归匹配，遇到多候选时会打印 manifest 并询问确认
+cargo run -- tests/assets/sb-pkg.jar patches/
+```
+行为说明：
+- 如果所有源文件都能唯一匹配目标，直接替换并输出 `applied: replaced=X` 摘要。
+- 如果存在冲突（多候选或找不到目标），会打印 TOML manifest，提示 `[y/N]` 是否继续应用已匹配的部分；输入 `y`/`yes` 继续，否则退出不改动。
+
+### 单参递归列出（仍为默认）
 ```bash
 cargo run -- list tests/assets/sb-pkg.jar
-# 或
+# 或直接
 cargo run -- tests/assets/sb-pkg.jar
 ```
+不带任何参数会打印帮助并返回非零状态，便于脚本检测。
 
 ### 获取单个文件（支持嵌套 `!/`）
 ```bash
