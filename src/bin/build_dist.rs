@@ -5,79 +5,92 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::env::args;
+
 use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
 
 fn main() -> Result<()> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    env::set_current_dir(&root)?;
+    assert!(
+        args().len() > 0,
+        "args should always have at least one element (the program name)"
+    );
 
-    let bin_name = "zipr";
-    let version = package_version(&root)?;
-    let target_triple = host_target()?;
-    let git_rev = git_revision();
-    let package_name = format!("{bin_name}-v{version}-{target_triple}-{git_rev}");
-    let dist_root = root.join("dist");
-    let out_dir = dist_root.join(&package_name);
+    match args().nth(1).as_deref() {
+        Some("clean") => clean_dist(),
+        Some(cmd) => bail!("unknown command: {cmd}"),
+        None => {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            env::set_current_dir(&root)?;
 
-    println!("[1/4] build release binary");
-    run_checked(
-        Command::new("cargo")
-            .arg("build")
-            .arg("--release")
-            .arg("--bin")
-            .arg(bin_name)
-            .env("GIT_HEAD_REV", &git_rev),
-    )?;
+            let bin_name = "zipr";
+            let version = package_version(&root)?;
+            let target_triple = host_target()?;
+            let git_rev = git_revision();
+            let package_name = format!("{bin_name}-v{version}-{target_triple}-{git_rev}");
+            let dist_root = root.join("dist");
+            let out_dir = dist_root.join(&package_name);
 
-    println!("[2/4] prepare package layout");
-    if out_dir.exists() {
-        fs::remove_dir_all(&out_dir)?;
+            println!("[1/4] build release binary");
+            run_checked(
+                Command::new("cargo")
+                    .arg("build")
+                    .arg("--release")
+                    .arg("--bin")
+                    .arg(bin_name)
+                    .env("GIT_HEAD_REV", &git_rev),
+            )?;
+
+            println!("[2/4] prepare package layout");
+            if out_dir.exists() {
+                fs::remove_dir_all(&out_dir)?;
+            }
+            fs::create_dir_all(&out_dir)?;
+
+            let exe_name = if cfg!(windows) {
+                format!("{bin_name}.exe")
+            } else {
+                bin_name.to_string()
+            };
+            copy_file(
+                root.join("target/release").join(&exe_name),
+                out_dir.join(&exe_name),
+            )?;
+            copy_file(root.join("README.md"), out_dir.join("README.md"))?;
+            copy_file(
+                root.join("docs/USER_MANUAL_ZH.md"),
+                out_dir.join("USER_MANUAL_ZH.md"),
+            )?;
+            copy_file(
+                root.join("tests/assets/patch.sbpkg.toml"),
+                out_dir.join("patch.example.toml"),
+            )?;
+
+            println!("[3/4] write build metadata");
+            let built_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut f = fs::File::create(out_dir.join("BUILD_INFO.txt"))?;
+            writeln!(f, "name={bin_name}")?;
+            writeln!(f, "version={version}")?;
+            writeln!(f, "git_revision={git_rev}")?;
+            writeln!(f, "target={target_triple}")?;
+            writeln!(f, "built_at_unix={built_at}")?;
+
+            println!("[4/4] create zip package");
+            fs::create_dir_all(&dist_root)?;
+            let zip_path = dist_root.join(format!("{package_name}.zip"));
+            create_zip(&out_dir, &zip_path)?;
+
+            println!("done");
+            println!("package dir: {}", out_dir.display());
+            println!("package zip: {}", zip_path.display());
+            Ok(())
+        }
     }
-    fs::create_dir_all(&out_dir)?;
-
-    let exe_name = if cfg!(windows) {
-        format!("{bin_name}.exe")
-    } else {
-        bin_name.to_string()
-    };
-    copy_file(
-        root.join("target/release").join(&exe_name),
-        out_dir.join(&exe_name),
-    )?;
-    copy_file(root.join("README.md"), out_dir.join("README.md"))?;
-    copy_file(
-        root.join("docs/USER_MANUAL_ZH.md"),
-        out_dir.join("USER_MANUAL_ZH.md"),
-    )?;
-    copy_file(
-        root.join("tests/assets/patch.sbpkg.toml"),
-        out_dir.join("patch.example.toml"),
-    )?;
-
-    println!("[3/4] write build metadata");
-    let built_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut f = fs::File::create(out_dir.join("BUILD_INFO.txt"))?;
-    writeln!(f, "name={bin_name}")?;
-    writeln!(f, "version={version}")?;
-    writeln!(f, "git_revision={git_rev}")?;
-    writeln!(f, "target={target_triple}")?;
-    writeln!(f, "built_at_unix={built_at}")?;
-
-    println!("[4/4] create zip package");
-    fs::create_dir_all(&dist_root)?;
-    let zip_path = dist_root.join(format!("{package_name}.zip"));
-    create_zip(&out_dir, &zip_path)?;
-
-    println!("done");
-    println!("package dir: {}", out_dir.display());
-    println!("package zip: {}", zip_path.display());
-    Ok(())
 }
 
 fn package_version(root: &Path) -> Result<String> {
@@ -157,5 +170,17 @@ fn create_zip(src_dir: &Path, zip_path: &Path) -> Result<()> {
         writer.write_all(&bytes)?;
     }
     writer.finish()?;
+    Ok(())
+}
+
+fn clean_dist() -> Result<()> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dist_root = root.join("dist");
+    if dist_root.exists() {
+        fs::remove_dir_all(&dist_root)?;
+        println!("removed dist directory: {}", dist_root.display());
+    } else {
+        println!("dist directory does not exist, nothing to clean");
+    }
     Ok(())
 }
