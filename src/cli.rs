@@ -5,10 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::archive::{self, DiffKind, ReplaceOptions};
-use crate::config::Config;
-use crate::patch_spec::{LevelName, LevelPolicy, MethodPolicy, MtimePolicy};
-use crate::path_expr::parse_zip_expr;
+use zipr_lib::archive::{self, DiffKind, ReplaceOptions};
+use zipr_lib::config::Config;
+use zipr_lib::patch_spec::{LevelName, LevelPolicy, MethodPolicy, MtimePolicy};
+use zipr_lib::path_expr::parse_zip_expr;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),

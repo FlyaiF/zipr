@@ -1,8 +1,4 @@
-mod archive;
 mod cli;
-mod config;
-mod patch_spec;
-mod path_expr;
 
 use anyhow::Result;
 
