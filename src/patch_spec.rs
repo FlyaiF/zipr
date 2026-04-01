@@ -93,6 +93,31 @@ impl PatchSpec {
         Ok(spec)
     }
 
+    /// Read a spec file without running validation (allows unresolved entries).
+    pub fn read_from_file_lenient(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)?;
+        let spec = toml::from_str::<Self>(&raw)?;
+        Ok(spec)
+    }
+
+    /// Resolve an unresolved entry by either picking a target or ignoring it.
+    /// If `target` is `Some`, the entry is moved to the resolved `entry` list.
+    /// If `target` is `None`, the unresolved entry is simply removed (ignored).
+    pub fn resolve_entry(&mut self, source: &str, target: Option<&str>) {
+        self.unresolved.retain(|u| u.source != source);
+        if let Some(t) = target {
+            self.entry.push(PatchEntry {
+                target: t.to_string(),
+                source: Some(source.to_string()),
+                action: Action::Replace,
+                method: MethodPolicy::Inherit,
+                level: LevelPolicy::Name(LevelName::Inherit),
+                mtime: MtimePolicy::Source,
+                comment: CommentPolicy::Inherit,
+            });
+        }
+    }
+
     pub fn write_to_file(&self, path: &Path) -> Result<()> {
         let raw = toml::to_string_pretty(self)?;
         fs::write(path, raw)?;
