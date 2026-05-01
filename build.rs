@@ -16,12 +16,12 @@ fn git_head_revision() -> String {
     let out = Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
         .output();
-    if let Ok(out) = out {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return s;
-            }
+    if let Ok(out) = out
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return s;
         }
     }
     "unknown".to_string()

@@ -497,6 +497,9 @@ fn collect_inputs(source: &Path) -> Result<Vec<DraftInput>> {
         {
             let src_path = d.path();
             let rel = src_path.strip_prefix(source).unwrap_or(src_path);
+            if is_generated_patch_file(rel) {
+                continue;
+            }
             let rel_norm = normalize_path_for_zip(rel);
             let src_norm = normalize_path_for_zip(src_path);
             let base = rel
@@ -530,6 +533,13 @@ fn collect_inputs(source: &Path) -> Result<Vec<DraftInput>> {
     }
 
     bail!("source path does not exist: {}", source.display());
+}
+
+fn is_generated_patch_file(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("patch.draft.toml" | "patch.draft.orig.toml")
+    )
 }
 
 fn strip_root_from_target(target: &str) -> String {
@@ -696,7 +706,7 @@ fn resolve_method(original: &EntryMeta, opts: &ReplaceOptions) -> CompressionMet
 fn resolve_level(
     method: CompressionMethod,
     level_policy: &LevelPolicy,
-    original: CompressionMethod,
+    _original: CompressionMethod,
 ) -> Option<u8> {
     if method == CompressionMethod::Stored {
         return None;
@@ -704,13 +714,7 @@ fn resolve_level(
     match level_policy {
         LevelPolicy::Fixed(v) => Some(*v),
         LevelPolicy::Name(LevelName::Default) => None,
-        LevelPolicy::Name(LevelName::Inherit) => {
-            if original == CompressionMethod::Stored {
-                None
-            } else {
-                None
-            }
-        }
+        LevelPolicy::Name(LevelName::Inherit) => None,
     }
 }
 
@@ -735,8 +739,62 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     tf.write_all(bytes)?;
     tf.flush()?;
     let persisted: PathBuf = tf.into_temp_path().keep()?;
-    fs::rename(&persisted, path)?;
+    replace_file(&persisted, path)?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination)
+        .with_context(|| format!("failed to replace `{}`", destination.display()))
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+    if !destination.exists() {
+        return fs::rename(source, destination)
+            .with_context(|| format!("failed to move `{}` into place", source.display()));
+    }
+
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_dir = parent.join(".zipr-tmp");
+    fs::create_dir_all(&tmp_dir)?;
+    let backup = Builder::new()
+        .prefix("zipr-backup-")
+        .suffix(".bak")
+        .tempfile_in(&tmp_dir)?;
+    let backup_path = backup.path().to_path_buf();
+    drop(backup);
+    if backup_path.exists() {
+        fs::remove_file(&backup_path)?;
+    }
+
+    fs::rename(destination, &backup_path).with_context(|| {
+        format!(
+            "failed to move existing archive `{}` to backup",
+            destination.display()
+        )
+    })?;
+
+    match fs::rename(source, destination) {
+        Ok(()) => {
+            let _ = fs::remove_file(&backup_path);
+            Ok(())
+        }
+        Err(replace_err) => {
+            if let Err(restore_err) = fs::rename(&backup_path, destination) {
+                return Err(anyhow!(
+                    "failed to replace `{}`: {}; restore from `{}` also failed: {}",
+                    destination.display(),
+                    replace_err,
+                    backup_path.display(),
+                    restore_err
+                ));
+            }
+            Err(replace_err)
+                .with_context(|| format!("failed to replace `{}`", destination.display()))
+        }
+    }
 }
 
 fn to_zip_time(st: SystemTime) -> Option<DateTime> {
