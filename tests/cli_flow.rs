@@ -136,6 +136,36 @@ fn patch_draft_and_apply() -> Result<()> {
 }
 
 #[test]
+fn patch_draft_ignores_generated_spec_files() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("outer.zip");
+    build_nested_archive(&archive)?;
+    let patches = dir.path().join("patches");
+    fs::create_dir_all(&patches)?;
+    fs::write(patches.join("a.txt"), b"from-patch")?;
+    fs::write(patches.join("patch.draft.toml"), b"stale draft")?;
+    fs::write(patches.join("patch.draft.orig.toml"), b"stale backup")?;
+
+    let draft = patches.join("patch.draft.toml");
+    let output = bin_cmd(dir.path())
+        .arg("patch")
+        .arg("draft")
+        .arg(&archive)
+        .arg("--from-dir")
+        .arg(&patches)
+        .arg("-o")
+        .arg(&draft)
+        .output()?;
+    assert!(output.status.success());
+
+    let spec = fs::read_to_string(&draft)?;
+    assert!(spec.contains("a.txt"));
+    assert!(!spec.contains("patch.draft.toml"));
+    assert!(!spec.contains("patch.draft.orig.toml"));
+    Ok(())
+}
+
+#[test]
 fn diff_shows_added_removed_modified_and_metadata() -> Result<()> {
     let dir = tempdir()?;
     let left = dir.path().join("left.zip");
