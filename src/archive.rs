@@ -586,7 +586,8 @@ fn backup_path_for(archive_path: &Path, attempt: u16) -> PathBuf {
 }
 
 /// Restore an archive from a previously-created backup file.
-/// The backup is moved into place over the archive (atomic on Unix; backup-swap on Windows).
+/// The backup is read and the archive is rewritten atomically from those bytes.
+/// If the restore succeeds, the backup file is then removed.
 /// The backup path must be a sibling of the archive (same parent directory).
 pub fn restore_backup(archive_path: &Path, backup_path: &Path) -> Result<()> {
     if !backup_path.exists() {
