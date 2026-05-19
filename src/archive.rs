@@ -62,7 +62,8 @@ pub struct DraftSummary {
 pub struct ApplySummary {
     pub replaced: usize,
     pub deleted: usize,
-    /// Absolute path to the pre-apply backup of the archive. `None` for dry-run.
+    /// Path to the pre-apply backup of the archive. May be relative if the
+    /// input archive path was relative. `None` for dry-run.
     pub backup_path: Option<String>,
 }
 
