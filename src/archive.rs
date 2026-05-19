@@ -1,5 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -30,6 +30,11 @@ pub struct ListedEntry {
     pub expr: String,
     pub size: u64,
     pub compressed_size: u64,
+    /// True if this entry is itself an archive (zip/jar/war/ear). Whether the
+    /// nested archive's children are present in the same list depends on
+    /// which list function was called: `list_recursive` includes them,
+    /// `list_top_level` does not.
+    pub is_archive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +62,8 @@ pub struct DraftSummary {
 pub struct ApplySummary {
     pub replaced: usize,
     pub deleted: usize,
+    /// Absolute path to the pre-apply backup of the archive. `None` for dry-run.
+    pub backup_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +107,44 @@ pub fn list_recursive(path: &Path, config: &Config) -> Result<Vec<ListedEntry>> 
     let mut out = Vec::new();
     let root = path.to_string_lossy().to_string();
     recurse_list(&mut archive, &root, config, &mut out)?;
+    Ok(out)
+}
+
+/// List only the top-level entries of an archive (no nested-archive expansion).
+/// Callers that need a nested archive's children must request them separately
+/// via `list_segment` using the entry's `expr`.
+pub fn list_top_level(path: &Path, config: &Config) -> Result<Vec<ListedEntry>> {
+    let file = File::open(path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut out = Vec::new();
+    let root = path.to_string_lossy().to_string();
+    list_one_level(&mut archive, &root, config, &mut out)?;
+    Ok(out)
+}
+
+/// List the top-level entries of the archive denoted by `zip_expr`. This may
+/// be the root archive (when there are no segments) or any nested archive
+/// addressed by the full segment chain (e.g. `outer.war!/inner.jar` returns
+/// inner.jar's children).
+pub fn list_segment(zip_expr: &ZipExpr, config: &Config) -> Result<Vec<ListedEntry>> {
+    if zip_expr.segments.is_empty() {
+        return list_top_level(&zip_expr.root_archive, config);
+    }
+
+    let mut bytes = fs::read(&zip_expr.root_archive)?;
+    let mut prefix = normalize_path_for_zip(&zip_expr.root_archive);
+    for seg in &zip_expr.segments {
+        if !config.is_archive_name(seg) {
+            bail!("segment `{seg}` is not recognized as an archive extension");
+        }
+        bytes = read_from_bytes(&bytes, seg)
+            .with_context(|| format!("archive segment `{seg}` not found in nested chain"))?;
+        prefix = make_expr(&prefix, seg);
+    }
+
+    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    let mut out = Vec::new();
+    list_one_level(&mut archive, &prefix, config, &mut out)?;
     Ok(out)
 }
 
@@ -254,19 +299,45 @@ fn recurse_list<R: Read + Seek>(
         }
         let name = file.name().to_string();
         let expr = make_expr(prefix, &name);
+        let is_archive = config.is_archive_name(&name);
         out.push(ListedEntry {
             expr: expr.clone(),
             size: file.size(),
             compressed_size: file.compressed_size(),
+            is_archive,
         });
 
-        if config.is_archive_name(&name) {
+        if is_archive {
             let mut nested = Vec::new();
             file.read_to_end(&mut nested)?;
             if let Ok(mut nested_archive) = ZipArchive::new(Cursor::new(nested)) {
                 recurse_list(&mut nested_archive, &expr, config, out)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn list_one_level<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    prefix: &str,
+    config: &Config,
+    out: &mut Vec<ListedEntry>,
+) -> Result<()> {
+    for i in 0..archive.len() {
+        let file = archive.by_index(i)?;
+        if file.is_dir() {
+            continue;
+        }
+        let name = file.name().to_string();
+        let expr = make_expr(prefix, &name);
+        let is_archive = config.is_archive_name(&name);
+        out.push(ListedEntry {
+            expr,
+            size: file.size(),
+            compressed_size: file.compressed_size(),
+            is_archive,
+        });
     }
     Ok(())
 }
@@ -323,6 +394,58 @@ pub fn patch_draft(
     Ok(summary)
 }
 
+/// Extend an existing patch spec with additional source files/directories.
+/// Existing entries and unresolved items are preserved verbatim; new inputs whose
+/// `source` already appears in the spec are skipped.
+pub fn patch_draft_extend(
+    archive_path: &Path,
+    spec_path: &Path,
+    additional_sources: &[PathBuf],
+    config: &Config,
+) -> Result<DraftSummary> {
+    let mut existing = PatchSpec::read_from_file_lenient(spec_path)?;
+
+    let mut seen_sources: HashSet<String> = HashSet::new();
+    for e in &existing.entry {
+        if let Some(s) = &e.source {
+            seen_sources.insert(s.clone());
+        }
+    }
+    for u in &existing.unresolved {
+        seen_sources.insert(u.source.clone());
+    }
+    let existing_targets: HashSet<String> =
+        existing.entry.iter().map(|e| e.target.clone()).collect();
+
+    let mut new_inputs: Vec<DraftInput> = Vec::new();
+    for src in additional_sources {
+        let inputs = collect_inputs(src)?;
+        for input in inputs {
+            if seen_sources.contains(&input.source_norm) {
+                continue;
+            }
+            seen_sources.insert(input.source_norm.clone());
+            new_inputs.push(input);
+        }
+    }
+
+    let (new_spec, _) = build_patch_spec(archive_path, new_inputs, config)?;
+    for entry in new_spec.entry {
+        if !existing_targets.contains(&entry.target) {
+            existing.entry.push(entry);
+        }
+    }
+    for u in new_spec.unresolved {
+        existing.unresolved.push(u);
+    }
+
+    existing.write_to_file(spec_path)?;
+    Ok(DraftSummary {
+        matched: existing.entry.len(),
+        unresolved: existing.unresolved.len(),
+    })
+}
+
 pub fn patch_apply(
     archive_path: &Path,
     spec_path: &Path,
@@ -343,6 +466,7 @@ pub fn patch_apply_spec(
     let mut summary = ApplySummary {
         replaced: 0,
         deleted: 0,
+        backup_path: None,
     };
 
     for e in &spec.entry {
@@ -395,9 +519,97 @@ pub fn patch_apply_spec(
     }
 
     if !dry_run {
+        let backup = write_backup(archive_path)?;
+        summary.backup_path = Some(normalize_path_for_zip(&backup));
         write_atomically(archive_path, &current)?;
     }
     Ok(summary)
+}
+
+fn write_backup(archive_path: &Path) -> Result<PathBuf> {
+    let mut source = File::open(archive_path).with_context(|| {
+        format!(
+            "failed to open archive `{}` for backup",
+            archive_path.display()
+        )
+    })?;
+    for attempt in 0..1000 {
+        let backup = backup_path_for(archive_path, attempt);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(mut dest) => {
+                std::io::copy(&mut source, &mut dest).with_context(|| {
+                    format!("failed to write backup `{}` before apply", backup.display())
+                })?;
+                return Ok(backup);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to create backup `{}` before apply",
+                        backup.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!(
+        "failed to choose an unused backup path for `{}`",
+        archive_path.display()
+    );
+}
+
+fn backup_path_for(archive_path: &Path, attempt: u16) -> PathBuf {
+    let now = OffsetDateTime::now_utc();
+    let stamp = format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}.{:09}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        now.nanosecond()
+    );
+    let mut path = archive_path.as_os_str().to_os_string();
+    if attempt == 0 {
+        path.push(format!(".bak-{stamp}"));
+    } else {
+        path.push(format!(".bak-{stamp}-{attempt}"));
+    }
+    PathBuf::from(path)
+}
+
+/// Restore an archive from a previously-created backup file.
+/// The backup is moved into place over the archive (atomic on Unix; backup-swap on Windows).
+/// The backup path must be a sibling of the archive (same parent directory).
+pub fn restore_backup(archive_path: &Path, backup_path: &Path) -> Result<()> {
+    if !backup_path.exists() {
+        bail!("backup file not found: {}", backup_path.display());
+    }
+    let archive_parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
+    let backup_parent = backup_path.parent().unwrap_or_else(|| Path::new("."));
+    if archive_parent != backup_parent {
+        bail!(
+            "backup `{}` must live next to archive `{}`",
+            backup_path.display(),
+            archive_path.display()
+        );
+    }
+    let bytes = fs::read(backup_path)
+        .with_context(|| format!("failed to read backup `{}`", backup_path.display()))?;
+    write_atomically(archive_path, &bytes)?;
+    fs::remove_file(backup_path).with_context(|| {
+        format!(
+            "restored archive but failed to remove backup `{}`",
+            backup_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn build_patch_spec(
