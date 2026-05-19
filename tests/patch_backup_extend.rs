@@ -1,11 +1,12 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use tempfile::tempdir;
 use zip::CompressionMethod;
+use zip::ZipArchive;
 use zip::write::SimpleFileOptions;
 
 use zipr_lib::archive::{self, patch_draft_extend, restore_backup};
@@ -22,6 +23,15 @@ fn write_simple_zip(path: &Path, entries: &[(&str, &[u8])]) -> Result<()> {
     }
     w.finish()?;
     Ok(())
+}
+
+fn read_simple_zip_entry(path: &Path, name: &str) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut entry = archive.by_name(name)?;
+    let mut out = Vec::new();
+    entry.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 #[test]
@@ -67,6 +77,33 @@ fn apply_creates_backup_and_restore_round_trips() -> Result<()> {
 }
 
 #[test]
+fn apply_replaces_multiple_entries_in_one_patch() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("app.zip");
+    write_simple_zip(
+        &archive,
+        &[("a.txt", b"a-original"), ("b.txt", b"b-original")],
+    )?;
+
+    let patches = dir.path().join("patches");
+    fs::create_dir_all(&patches)?;
+    fs::write(patches.join("a.txt"), b"a-new")?;
+    fs::write(patches.join("b.txt"), b"b-new")?;
+
+    let spec_path = dir.path().join("spec.toml");
+    archive::patch_draft(&archive, &patches, &spec_path, &Config::default())?;
+
+    let summary = archive::patch_apply(&archive, &spec_path, false, &Config::default())?;
+
+    assert_eq!(summary.replaced, 2);
+    assert_eq!(read_simple_zip_entry(&archive, "a.txt")?, b"a-new");
+    assert_eq!(read_simple_zip_entry(&archive, "b.txt")?, b"b-new");
+    let listed = archive::list_recursive(&archive, &Config::default())?;
+    assert_eq!(listed.len(), 2);
+    Ok(())
+}
+
+#[test]
 fn dry_run_does_not_create_backup() -> Result<()> {
     let dir = tempdir()?;
     let archive = dir.path().join("app.zip");
@@ -82,6 +119,58 @@ fn dry_run_does_not_create_backup() -> Result<()> {
         summary.backup_path.is_none(),
         "dry-run must not write backup"
     );
+    Ok(())
+}
+
+#[test]
+fn dry_run_does_not_rewrite_archive_bytes() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("app.zip");
+    write_simple_zip(&archive, &[("hello.txt", b"x")])?;
+    let original = fs::read(&archive)?;
+    let patches = dir.path().join("patches");
+    fs::create_dir_all(&patches)?;
+    fs::write(patches.join("hello.txt"), b"y")?;
+    let spec_path = dir.path().join("spec.toml");
+    archive::patch_draft(&archive, &patches, &spec_path, &Config::default())?;
+
+    let summary = archive::patch_apply(&archive, &spec_path, true, &Config::default())?;
+
+    assert_eq!(summary.replaced, 1);
+    assert_eq!(summary.deleted, 0);
+    assert_eq!(fs::read(&archive)?, original);
+    Ok(())
+}
+
+#[test]
+fn dry_run_reports_missing_target_without_rewriting() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("app.zip");
+    write_simple_zip(&archive, &[("hello.txt", b"x")])?;
+    let original = fs::read(&archive)?;
+    let source = dir.path().join("replacement.txt");
+    fs::write(&source, b"y")?;
+    let spec_path = dir.path().join("spec.toml");
+    fs::write(
+        &spec_path,
+        format!(
+            r#"version = 1
+
+[[entry]]
+target = "{}!/missing.txt"
+source = "{}"
+action = "replace"
+"#,
+            archive.to_string_lossy().replace('\\', "/"),
+            source.to_string_lossy().replace('\\', "/"),
+        ),
+    )?;
+
+    let err = archive::patch_apply(&archive, &spec_path, true, &Config::default())
+        .expect_err("missing target should fail dry-run");
+
+    assert!(err.to_string().contains("target not found"));
+    assert_eq!(fs::read(&archive)?, original);
     Ok(())
 }
 

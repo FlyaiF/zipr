@@ -463,7 +463,34 @@ pub fn patch_apply_spec(
     dry_run: bool,
     config: &Config,
 ) -> Result<ApplySummary> {
-    let mut current = fs::read(archive_path)?;
+    let mut summary = patch_validate_spec(archive_path, spec, config)?;
+    if dry_run {
+        return Ok(summary);
+    }
+
+    let plan = build_patch_plan(archive_path, spec)?;
+    let original = fs::read(archive_path)?;
+    let (next, changed) = mutate_archive_bytes_planned(&original, &plan, config)?;
+    if !changed && !spec.entry.is_empty() {
+        bail!("no patch targets were changed");
+    }
+
+    let backup = write_backup(archive_path)?;
+    summary.backup_path = Some(normalize_path_for_zip(&backup));
+    write_atomically(archive_path, &next)?;
+    Ok(summary)
+}
+
+fn patch_validate_spec(
+    archive_path: &Path,
+    spec: &PatchSpec,
+    config: &Config,
+) -> Result<ApplySummary> {
+    let archive_targets = list_recursive(archive_path, config)?
+        .into_iter()
+        .map(|e| e.expr)
+        .collect::<HashSet<_>>();
+    let archive_root = normalize_path_for_zip(archive_path);
     let mut summary = ApplySummary {
         replaced: 0,
         deleted: 0,
@@ -471,22 +498,48 @@ pub fn patch_apply_spec(
     };
 
     for e in &spec.entry {
-        let expr = parse_zip_expr(&format!(
-            "{}!/{target}",
-            normalize_path_for_zip(archive_path),
-            target = strip_root_from_target(&e.target)
-        ))?;
-
+        let target = normalize_patch_target(&archive_root, &e.target);
+        if !archive_targets.contains(&target) {
+            bail!("target not found during patch dry-run: {}", e.target);
+        }
         match e.action {
             Action::Delete => {
-                let (next, changed) =
-                    mutate_archive_bytes(&current, &expr.segments, Mutation::Delete, config)?;
-                if !changed {
-                    bail!("target not found during delete: {}", e.target);
-                }
-                current = next;
                 summary.deleted += 1;
             }
+            Action::Replace => {
+                let source = e
+                    .source
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("replace entry missing source: {}", e.target))?;
+                fs::metadata(source)
+                    .with_context(|| format!("failed to stat source file `{source}` for patch"))?;
+                summary.replaced += 1;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+fn normalize_patch_target(archive_root: &str, target: &str) -> String {
+    if target.contains("!/") {
+        target.to_string()
+    } else {
+        format!("{archive_root}!/{}", strip_root_from_target(target))
+    }
+}
+
+fn build_patch_plan(archive_path: &Path, spec: &PatchSpec) -> Result<PatchPlanNode> {
+    let archive_root = normalize_path_for_zip(archive_path);
+    let mut plan = PatchPlanNode::default();
+
+    for e in &spec.entry {
+        let expr = parse_zip_expr(&format!(
+            "{archive_root}!/{target}",
+            target = strip_root_from_target(&e.target)
+        ))?;
+        let mutation = match e.action {
+            Action::Delete => Mutation::Delete,
             Action::Replace => {
                 let source = e
                     .source
@@ -495,36 +548,52 @@ pub fn patch_apply_spec(
                 let bytes = fs::read(source)
                     .with_context(|| format!("failed to read source file `{source}` for patch"))?;
                 let source_mtime = fs::metadata(source).ok().and_then(|m| m.modified().ok());
-                let opts = ReplaceOptions {
-                    method: e.method.clone(),
-                    level: e.level.clone(),
-                    mtime: e.mtime.clone(),
-                };
-                let (next, changed) = mutate_archive_bytes(
-                    &current,
-                    &expr.segments,
-                    Mutation::Replace {
-                        bytes,
-                        opts,
-                        source_mtime,
+                Mutation::Replace {
+                    bytes,
+                    opts: ReplaceOptions {
+                        method: e.method.clone(),
+                        level: e.level.clone(),
+                        mtime: e.mtime.clone(),
                     },
-                    config,
-                )?;
-                if !changed {
-                    bail!("target not found during replace: {}", e.target);
+                    source_mtime,
                 }
-                current = next;
-                summary.replaced += 1;
             }
-        }
+        };
+        insert_patch_plan(&mut plan, &expr.segments, mutation, &e.target)?;
     }
 
-    if !dry_run {
-        let backup = write_backup(archive_path)?;
-        summary.backup_path = Some(normalize_path_for_zip(&backup));
-        write_atomically(archive_path, &current)?;
+    Ok(plan)
+}
+
+fn insert_patch_plan(
+    plan: &mut PatchPlanNode,
+    segments: &[String],
+    mutation: Mutation,
+    target: &str,
+) -> Result<()> {
+    if segments.is_empty() {
+        bail!("empty patch target: {target}");
     }
-    Ok(summary)
+
+    let mut node = plan;
+    for seg in &segments[..segments.len() - 1] {
+        if node.mutation.is_some() {
+            bail!("patch target conflicts with nested target: {target}");
+        }
+        node = node.children.entry(seg.clone()).or_default();
+    }
+
+    let leaf = node
+        .children
+        .entry(segments[segments.len() - 1].clone())
+        .or_default();
+    if !leaf.children.is_empty() {
+        bail!("patch target conflicts with nested target: {target}");
+    }
+    if leaf.mutation.replace(mutation).is_some() {
+        bail!("duplicate patch target: {target}");
+    }
+    Ok(())
 }
 
 fn write_backup(archive_path: &Path) -> Result<PathBuf> {
@@ -764,6 +833,7 @@ fn strip_root_from_target(target: &str) -> String {
     }
 }
 
+#[derive(Clone)]
 enum Mutation {
     Delete,
     Replace {
@@ -771,6 +841,12 @@ enum Mutation {
         opts: ReplaceOptions,
         source_mtime: Option<SystemTime>,
     },
+}
+
+#[derive(Default)]
+struct PatchPlanNode {
+    mutation: Option<Mutation>,
+    children: HashMap<String, PatchPlanNode>,
 }
 
 fn mutate_archive_bytes(
@@ -852,6 +928,84 @@ fn mutate_archive_bytes(
                     source_mtime.and_then(to_zip_time),
                 )?;
             }
+        }
+    }
+
+    let cursor = writer.finish()?;
+    Ok((cursor.into_inner(), changed))
+}
+
+fn mutate_archive_bytes_planned(
+    source: &[u8],
+    plan: &PatchPlanNode,
+    config: &Config,
+) -> Result<(Vec<u8>, bool)> {
+    let mut src_archive = ZipArchive::new(Cursor::new(source))?;
+    let out_cursor = Cursor::new(Vec::<u8>::new());
+    let mut writer = ZipWriter::new(out_cursor);
+    let mut changed = false;
+
+    for i in 0..src_archive.len() {
+        let mut file = src_archive.by_index(i)?;
+        let name = file.name().to_string();
+        let Some(entry_plan) = plan.children.get(&name) else {
+            writer.raw_copy_file(file)?;
+            continue;
+        };
+
+        let file_meta = EntryMeta {
+            method: file.compression(),
+            mtime: file.last_modified(),
+            unix_mode: file.unix_mode(),
+        };
+
+        if !entry_plan.children.is_empty() {
+            if entry_plan.mutation.is_some() {
+                bail!("patch target conflicts with nested target: {name}");
+            }
+            if !config.is_archive_name(&name) {
+                bail!("segment `{name}` is not an archive but nested path continues");
+            }
+            let mut nested_bytes = Vec::new();
+            file.read_to_end(&mut nested_bytes)?;
+            let (next_nested, nested_changed) =
+                mutate_archive_bytes_planned(&nested_bytes, entry_plan, config)?;
+            changed |= nested_changed;
+            if nested_changed {
+                copy_new_entry(
+                    &mut writer,
+                    &name,
+                    &next_nested,
+                    file_meta,
+                    &ReplaceOptions::default(),
+                    file.last_modified(),
+                )?;
+            } else {
+                writer.raw_copy_file(file)?;
+            }
+            continue;
+        }
+
+        match &entry_plan.mutation {
+            Some(Mutation::Delete) => {
+                changed = true;
+            }
+            Some(Mutation::Replace {
+                bytes,
+                opts,
+                source_mtime,
+            }) => {
+                changed = true;
+                copy_new_entry(
+                    &mut writer,
+                    &name,
+                    bytes,
+                    file_meta,
+                    opts,
+                    source_mtime.and_then(to_zip_time),
+                )?;
+            }
+            None => writer.raw_copy_file(file)?,
         }
     }
 
