@@ -415,7 +415,7 @@ pub fn patch_draft_extend(
     for u in &existing.unresolved {
         seen_sources.insert(u.source.clone());
     }
-    let existing_targets: HashSet<String> =
+    let mut existing_targets: HashSet<String> =
         existing.entry.iter().map(|e| e.target.clone()).collect();
 
     let mut new_inputs: Vec<DraftInput> = Vec::new();
@@ -432,7 +432,7 @@ pub fn patch_draft_extend(
 
     let (new_spec, _) = build_patch_spec(archive_path, new_inputs, config)?;
     for entry in new_spec.entry {
-        if !existing_targets.contains(&entry.target) {
+        if existing_targets.insert(entry.target.clone()) {
             existing.entry.push(entry);
         }
     }

@@ -145,3 +145,38 @@ fn draft_extend_skips_duplicate_sources() -> Result<()> {
     assert_eq!(merged.entry.len(), 1);
     Ok(())
 }
+
+#[test]
+fn draft_extend_skips_duplicate_targets_from_new_sources() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("app.zip");
+    write_simple_zip(&archive, &[("a.txt", b"a")])?;
+
+    let spec_path = dir.path().join("spec.toml");
+    let empty = dir.path().join("empty");
+    fs::create_dir_all(&empty)?;
+    archive::patch_draft(&archive, &empty, &spec_path, &Config::default())?;
+
+    let patches1 = dir.path().join("patches1");
+    let patches2 = dir.path().join("patches2");
+    fs::create_dir_all(&patches1)?;
+    fs::create_dir_all(&patches2)?;
+    fs::write(patches1.join("a.txt"), b"a-new-1")?;
+    fs::write(patches2.join("a.txt"), b"a-new-2")?;
+
+    let summary = patch_draft_extend(
+        &archive,
+        &spec_path,
+        &[patches1, patches2],
+        &Config::default(),
+    )?;
+    assert_eq!(
+        summary.matched, 1,
+        "duplicate target should be de-duplicated"
+    );
+    assert_eq!(summary.unresolved, 0);
+
+    let merged = PatchSpec::read_from_file(&spec_path)?;
+    assert_eq!(merged.entry.len(), 1);
+    Ok(())
+}
