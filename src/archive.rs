@@ -1288,5 +1288,5 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
 
 fn to_zip_time(st: SystemTime) -> Option<DateTime> {
     let odt: OffsetDateTime = st.into();
-    DateTime::try_from(odt).ok()
+    DateTime::try_from(time::PrimitiveDateTime::new(odt.date(), odt.time())).ok()
 }

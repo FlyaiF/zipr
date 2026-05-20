@@ -346,5 +346,8 @@ fn nested_entry_time(path: &Path, nested: &str, entry: &str) -> Result<DateTime>
 
 fn to_zip_dt(st: SystemTime) -> Result<DateTime> {
     let odt: time::OffsetDateTime = st.into();
-    Ok(DateTime::try_from(odt)?)
+    Ok(DateTime::try_from(time::PrimitiveDateTime::new(
+        odt.date(),
+        odt.time(),
+    ))?)
 }
