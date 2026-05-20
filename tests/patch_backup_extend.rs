@@ -239,6 +239,45 @@ action = "replace"
 }
 
 #[test]
+fn apply_reports_missing_target_without_rewriting_or_leaking_temp_file() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("app.zip");
+    write_simple_zip(&archive, &[("hello.txt", b"x")])?;
+    let original = fs::read(&archive)?;
+    let source = dir.path().join("replacement.txt");
+    fs::write(&source, b"y")?;
+    let spec_path = dir.path().join("spec.toml");
+    fs::write(
+        &spec_path,
+        format!(
+            r#"version = 1
+
+[[entry]]
+target = "{}!/missing.txt"
+source = "{}"
+action = "replace"
+"#,
+            archive.to_string_lossy().replace('\\', "/"),
+            source.to_string_lossy().replace('\\', "/"),
+        ),
+    )?;
+
+    let err = archive::patch_apply(&archive, &spec_path, false, &Config::default())
+        .expect_err("missing target should fail apply");
+
+    assert!(err.to_string().contains("target not found"));
+    assert_eq!(fs::read(&archive)?, original);
+    let tmp_dir = archive.parent().unwrap().join(".zipr-tmp");
+    if tmp_dir.exists() {
+        assert!(
+            fs::read_dir(tmp_dir)?.next().is_none(),
+            "failed apply should not leave temp files"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn draft_extend_preserves_existing_entries_and_adds_new_ones() -> Result<()> {
     let dir = tempdir()?;
     let archive = dir.path().join("app.zip");

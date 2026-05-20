@@ -480,15 +480,21 @@ pub fn patch_apply_spec(
         return Ok(summary);
     }
 
-    let original = fs::read(archive_path)?;
-    let (next, changed) = mutate_archive_bytes_planned(&original, &plan, config)?;
+    let (next_path, changed) = mutate_archive_file_planned(archive_path, &plan, config)?;
     if !changed && !spec.entry.is_empty() {
+        let _ = fs::remove_file(&next_path);
         bail!("no patch targets were changed");
     }
 
-    let backup = write_backup(archive_path)?;
+    let backup = match write_backup(archive_path) {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = fs::remove_file(&next_path);
+            return Err(err);
+        }
+    };
     summary.backup_path = Some(normalize_path_for_zip(&backup));
-    write_atomically(archive_path, &next)?;
+    replace_file(&next_path, archive_path)?;
     summary.elapsed_ms = started.elapsed().as_millis();
     Ok(summary)
 }
@@ -1014,6 +1020,48 @@ fn mutate_archive_bytes_planned(
     let mut src_archive = ZipArchive::new(Cursor::new(source))?;
     let out_cursor = Cursor::new(Vec::<u8>::new());
     let mut writer = ZipWriter::new(out_cursor);
+    let changed = mutate_archive_to_writer(&mut src_archive, &mut writer, plan, config)?;
+    let cursor = writer.finish()?;
+    Ok((cursor.into_inner(), changed))
+}
+
+fn mutate_archive_file_planned(
+    source_path: &Path,
+    plan: &PatchPlanNode,
+    config: &Config,
+) -> Result<(PathBuf, bool)> {
+    let file = File::open(source_path)?;
+    let mut src_archive = ZipArchive::new(file)?;
+    let parent = source_path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_dir = parent.join(".zipr-tmp");
+    fs::create_dir_all(&tmp_dir)?;
+    let mut tf = Builder::new()
+        .prefix("zipr-")
+        .suffix(".tmp")
+        .tempfile_in(&tmp_dir)?;
+
+    let changed = {
+        let mut writer = ZipWriter::new(&mut tf);
+        let changed = mutate_archive_to_writer(&mut src_archive, &mut writer, plan, config)?;
+        writer.finish()?;
+        changed
+    };
+
+    tf.flush()?;
+    let persisted = tf.into_temp_path().keep()?;
+    Ok((persisted, changed))
+}
+
+fn mutate_archive_to_writer<R, W>(
+    src_archive: &mut ZipArchive<R>,
+    writer: &mut ZipWriter<W>,
+    plan: &PatchPlanNode,
+    config: &Config,
+) -> Result<bool>
+where
+    R: Read + Seek,
+    W: Write + Seek,
+{
     let mut changed = false;
     let mut found = HashSet::new();
 
@@ -1046,7 +1094,7 @@ fn mutate_archive_bytes_planned(
             changed |= nested_changed;
             if nested_changed {
                 copy_new_entry(
-                    &mut writer,
+                    writer,
                     &name,
                     &next_nested,
                     file_meta,
@@ -1070,7 +1118,7 @@ fn mutate_archive_bytes_planned(
             }) => {
                 changed = true;
                 copy_new_entry(
-                    &mut writer,
+                    writer,
                     &name,
                     bytes,
                     file_meta,
@@ -1083,8 +1131,7 @@ fn mutate_archive_bytes_planned(
     }
 
     ensure_all_plan_children_found(plan, &found, "patch apply")?;
-    let cursor = writer.finish()?;
-    Ok((cursor.into_inner(), changed))
+    Ok(changed)
 }
 
 fn mutation_for_nested(m: &Mutation) -> Mutation {
@@ -1102,8 +1149,8 @@ fn mutation_for_nested(m: &Mutation) -> Mutation {
     }
 }
 
-fn copy_new_entry(
-    writer: &mut ZipWriter<Cursor<Vec<u8>>>,
+fn copy_new_entry<W: Write + Seek>(
+    writer: &mut ZipWriter<W>,
     name: &str,
     data: &[u8],
     original: EntryMeta,
