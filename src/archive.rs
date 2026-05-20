@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tempfile::Builder;
@@ -62,6 +62,8 @@ pub struct DraftSummary {
 pub struct ApplySummary {
     pub replaced: usize,
     pub deleted: usize,
+    /// Wall-clock time spent validating/applying the patch, in milliseconds.
+    pub elapsed_ms: u128,
     /// Path to the pre-apply backup of the archive. May be relative if the
     /// input archive path was relative. `None` for dry-run.
     pub backup_path: Option<String>,
@@ -463,12 +465,21 @@ pub fn patch_apply_spec(
     dry_run: bool,
     config: &Config,
 ) -> Result<ApplySummary> {
-    let mut summary = patch_validate_spec(archive_path, spec, config)?;
-    if dry_run {
+    let started = Instant::now();
+    spec.validate()?;
+    let mut summary = patch_validate_spec(spec)?;
+    if spec.entry.is_empty() {
+        summary.elapsed_ms = started.elapsed().as_millis();
         return Ok(summary);
     }
 
-    let plan = build_patch_plan(archive_path, spec)?;
+    let plan = build_patch_plan(archive_path, spec, !dry_run)?;
+    if dry_run {
+        validate_patch_plan_targets(archive_path, &plan, config)?;
+        summary.elapsed_ms = started.elapsed().as_millis();
+        return Ok(summary);
+    }
+
     let original = fs::read(archive_path)?;
     let (next, changed) = mutate_archive_bytes_planned(&original, &plan, config)?;
     if !changed && !spec.entry.is_empty() {
@@ -478,30 +489,19 @@ pub fn patch_apply_spec(
     let backup = write_backup(archive_path)?;
     summary.backup_path = Some(normalize_path_for_zip(&backup));
     write_atomically(archive_path, &next)?;
+    summary.elapsed_ms = started.elapsed().as_millis();
     Ok(summary)
 }
 
-fn patch_validate_spec(
-    archive_path: &Path,
-    spec: &PatchSpec,
-    config: &Config,
-) -> Result<ApplySummary> {
-    let archive_targets = list_recursive(archive_path, config)?
-        .into_iter()
-        .map(|e| e.expr)
-        .collect::<HashSet<_>>();
-    let archive_root = normalize_path_for_zip(archive_path);
+fn patch_validate_spec(spec: &PatchSpec) -> Result<ApplySummary> {
     let mut summary = ApplySummary {
         replaced: 0,
         deleted: 0,
+        elapsed_ms: 0,
         backup_path: None,
     };
 
     for e in &spec.entry {
-        let target = normalize_patch_target(&archive_root, &e.target);
-        if !archive_targets.contains(&target) {
-            bail!("target not found during patch dry-run: {}", e.target);
-        }
         match e.action {
             Action::Delete => {
                 summary.deleted += 1;
@@ -521,15 +521,11 @@ fn patch_validate_spec(
     Ok(summary)
 }
 
-fn normalize_patch_target(archive_root: &str, target: &str) -> String {
-    if target.contains("!/") {
-        target.to_string()
-    } else {
-        format!("{archive_root}!/{}", strip_root_from_target(target))
-    }
-}
-
-fn build_patch_plan(archive_path: &Path, spec: &PatchSpec) -> Result<PatchPlanNode> {
+fn build_patch_plan(
+    archive_path: &Path,
+    spec: &PatchSpec,
+    load_sources: bool,
+) -> Result<PatchPlanNode> {
     let archive_root = normalize_path_for_zip(archive_path);
     let mut plan = PatchPlanNode::default();
 
@@ -545,8 +541,13 @@ fn build_patch_plan(archive_path: &Path, spec: &PatchSpec) -> Result<PatchPlanNo
                     .source
                     .as_ref()
                     .ok_or_else(|| anyhow!("replace entry missing source: {}", e.target))?;
-                let bytes = fs::read(source)
-                    .with_context(|| format!("failed to read source file `{source}` for patch"))?;
+                let bytes = if load_sources {
+                    fs::read(source).with_context(|| {
+                        format!("failed to read source file `{source}` for patch")
+                    })?
+                } else {
+                    Vec::new()
+                };
                 let source_mtime = fs::metadata(source).ok().and_then(|m| m.modified().ok());
                 Mutation::Replace {
                     bytes,
@@ -593,7 +594,76 @@ fn insert_patch_plan(
     if leaf.mutation.replace(mutation).is_some() {
         bail!("duplicate patch target: {target}");
     }
+    leaf.target = Some(target.to_string());
     Ok(())
+}
+
+fn validate_patch_plan_targets(
+    archive_path: &Path,
+    plan: &PatchPlanNode,
+    config: &Config,
+) -> Result<()> {
+    let file = File::open(archive_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    validate_patch_plan_node(&mut archive, plan, config)
+}
+
+fn validate_patch_plan_node<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    plan: &PatchPlanNode,
+    config: &Config,
+) -> Result<()> {
+    let mut found = HashSet::new();
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let name = file.name().to_string();
+        let Some(entry_plan) = plan.children.get(&name) else {
+            continue;
+        };
+        found.insert(name.clone());
+
+        if entry_plan.children.is_empty() {
+            continue;
+        }
+        if entry_plan.mutation.is_some() {
+            bail!("patch target conflicts with nested target: {name}");
+        }
+        if !config.is_archive_name(&name) {
+            bail!("segment `{name}` is not an archive but nested path continues");
+        }
+        let mut nested_bytes = Vec::new();
+        file.read_to_end(&mut nested_bytes)?;
+        let mut nested_archive = ZipArchive::new(Cursor::new(nested_bytes))?;
+        validate_patch_plan_node(&mut nested_archive, entry_plan, config)?;
+    }
+
+    ensure_all_plan_children_found(plan, &found, "patch dry-run")
+}
+
+fn ensure_all_plan_children_found(
+    plan: &PatchPlanNode,
+    found: &HashSet<String>,
+    operation: &str,
+) -> Result<()> {
+    for (name, child) in &plan.children {
+        if !found.contains(name) {
+            bail!(
+                "target not found during {operation}: {}",
+                first_target_label(child, name)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn first_target_label(node: &PatchPlanNode, fallback: &str) -> String {
+    if let Some(target) = &node.target {
+        return target.clone();
+    }
+    if let Some((name, child)) = node.children.iter().next() {
+        return first_target_label(child, name);
+    }
+    fallback.to_string()
 }
 
 fn write_backup(archive_path: &Path) -> Result<PathBuf> {
@@ -847,6 +917,7 @@ enum Mutation {
 struct PatchPlanNode {
     mutation: Option<Mutation>,
     children: HashMap<String, PatchPlanNode>,
+    target: Option<String>,
 }
 
 fn mutate_archive_bytes(
@@ -944,6 +1015,7 @@ fn mutate_archive_bytes_planned(
     let out_cursor = Cursor::new(Vec::<u8>::new());
     let mut writer = ZipWriter::new(out_cursor);
     let mut changed = false;
+    let mut found = HashSet::new();
 
     for i in 0..src_archive.len() {
         let mut file = src_archive.by_index(i)?;
@@ -952,6 +1024,7 @@ fn mutate_archive_bytes_planned(
             writer.raw_copy_file(file)?;
             continue;
         };
+        found.insert(name.clone());
 
         let file_meta = EntryMeta {
             method: file.compression(),
@@ -1009,6 +1082,7 @@ fn mutate_archive_bytes_planned(
         }
     }
 
+    ensure_all_plan_children_found(plan, &found, "patch apply")?;
     let cursor = writer.finish()?;
     Ok((cursor.into_inner(), changed))
 }

@@ -25,6 +25,29 @@ fn write_simple_zip(path: &Path, entries: &[(&str, &[u8])]) -> Result<()> {
     Ok(())
 }
 
+fn write_zip_with_methods(path: &Path, entries: &[(&str, &[u8], CompressionMethod)]) -> Result<()> {
+    let file = fs::File::create(path)?;
+    let mut w = zip::ZipWriter::new(file);
+    for (name, data, method) in entries {
+        let opts = SimpleFileOptions::default().compression_method(*method);
+        w.start_file(*name, opts)?;
+        w.write_all(data)?;
+    }
+    w.finish()?;
+    Ok(())
+}
+
+fn corrupt_first_payload_byte(path: &Path, marker: &[u8]) -> Result<()> {
+    let mut bytes = fs::read(path)?;
+    let pos = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("marker should be present in stored zip payload");
+    bytes[pos] ^= 0xff;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
 fn read_simple_zip_entry(path: &Path, name: &str) -> Result<Vec<u8>> {
     let file = fs::File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -32,6 +55,47 @@ fn read_simple_zip_entry(path: &Path, name: &str) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     entry.read_to_end(&mut out)?;
     Ok(out)
+}
+
+#[test]
+fn apply_does_not_read_unrelated_nested_archive_payloads() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("app.zip");
+    let bad_payload = b"this payload has a deliberately bad crc";
+    write_zip_with_methods(
+        &archive,
+        &[
+            ("bad.jar", bad_payload, CompressionMethod::Stored),
+            ("hello.txt", b"original", CompressionMethod::Deflated),
+        ],
+    )?;
+    corrupt_first_payload_byte(&archive, bad_payload)?;
+
+    let source = dir.path().join("hello.txt");
+    fs::write(&source, b"patched")?;
+    let spec_path = dir.path().join("spec.toml");
+    fs::write(
+        &spec_path,
+        format!(
+            r#"version = 1
+
+[[entry]]
+target = "{}!/hello.txt"
+source = "{}"
+action = "replace"
+"#,
+            archive.to_string_lossy().replace('\\', "/"),
+            source.to_string_lossy().replace('\\', "/"),
+        ),
+    )?;
+
+    let dry_run = archive::patch_apply(&archive, &spec_path, true, &Config::default())?;
+    assert_eq!(dry_run.replaced, 1);
+
+    let summary = archive::patch_apply(&archive, &spec_path, false, &Config::default())?;
+    assert_eq!(summary.replaced, 1);
+    assert_eq!(read_simple_zip_entry(&archive, "hello.txt")?, b"patched");
+    Ok(())
 }
 
 #[test]

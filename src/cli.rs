@@ -249,8 +249,8 @@ fn run_fuzzy_replace(archive: &Path, source: &Path, config: &Config) -> Result<(
 
     let summary = archive::patch_apply_spec(archive, &spec, false, config)?;
     println!(
-        "applied: replaced={}, deleted={}",
-        summary.replaced, summary.deleted
+        "applied: replaced={}, deleted={}, elapsed_ms={}",
+        summary.replaced, summary.deleted, summary.elapsed_ms
     );
     Ok(())
 }
@@ -277,10 +277,11 @@ fn run_patch(cmd: PatchCmd, config: &Config) -> Result<()> {
         } => {
             let summary = archive::patch_apply(&archive, &spec, dry_run, config)?;
             println!(
-                "patch {}: replaced={}, deleted={}",
+                "patch {}: replaced={}, deleted={}, elapsed_ms={}",
                 if dry_run { "dry-run" } else { "applied" },
                 summary.replaced,
-                summary.deleted
+                summary.deleted,
+                summary.elapsed_ms
             );
         }
     }
