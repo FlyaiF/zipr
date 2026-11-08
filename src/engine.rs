@@ -1,6 +1,7 @@
 //! Typed, cancellable archive sessions and transactional patching.
 use crate::splice::{self, Change, Directory};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
@@ -180,6 +181,37 @@ impl Seek for Source {
         Ok(self.pos)
     }
 }
+/// Short, private session directory. Keep std's Windows verbatim prefix:
+/// stripping it with display-path normalization would reintroduce MAX_PATH.
+pub fn session_tempdir() -> std::io::Result<tempfile::TempDir> {
+    let parent = std::env::temp_dir().canonicalize()?;
+    tempfile::Builder::new().prefix("zr-").tempdir_in(parent)
+}
+
+/// Resolve the existing parent before creating a file (std preserves \\?\ on Windows).
+pub fn creation_path(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("missing filename"))?;
+    Ok(parent.canonicalize()?.join(name))
+}
+
+fn cache_path(dir: &Path, key: &str, salt: u64) -> PathBuf {
+    let mut hash = Sha256::new();
+    hash.update(key.as_bytes());
+    hash.update(salt.to_le_bytes());
+    let hash = hash.finalize();
+    let name = hash[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    dir.join(format!("{name}.bin"))
+}
+
 // Cache only owns paths and metadata; each operation opens its own Source.
 // Callers must drop returned Sources before starting a mutation.
 pub struct Cache {
@@ -190,7 +222,7 @@ pub struct Cache {
 impl Cache {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            dir: tempfile::tempdir()?,
+            dir: session_tempdir()?,
             files: Mutex::new(BTreeMap::new()),
             signatures: Mutex::new(BTreeMap::new()),
         })
@@ -255,7 +287,8 @@ impl Cache {
             event(progress, Phase::Inflate, &path, 0, rec.size);
             s.seek(SeekFrom::Start(at))?;
             let mut decoder = flate2::read::DeflateDecoder::new(s.take(rec.compressed));
-            let mut tmp = tempfile::NamedTempFile::new_in(self.dir.path())?;
+            let mut tmp = tempfile::NamedTempFile::new_in(self.dir.path())
+                .map_err(|e| EngineError::from(e).with_path(self.dir.path()))?;
             let mut h = crc32fast::Hasher::new();
             let mut n = 0;
             let mut b = [0; 128 * 1024];
@@ -266,7 +299,8 @@ impl Cache {
                     break;
                 }
                 h.update(&b[..k]);
-                tmp.write_all(&b[..k])?;
+                tmp.write_all(&b[..k])
+                    .map_err(|e| EngineError::from(e).with_path(tmp.path()))?;
                 n += k as u64;
                 event(progress, Phase::Inflate, &path, n, rec.size);
             }
@@ -274,10 +308,19 @@ impl Cache {
                 return Err(EngineError::VerifyFailed("inflate CRC/size".into()));
             }
             drop(decoder);
-            let p = tmp
-                .into_temp_path()
-                .keep()
-                .map_err(|e| EngineError::Io(e.error))?;
+            // The logical key stays in memory; no archive names enter filesystem paths.
+            // Salt collisions instead of aliasing two distinct cache entries.
+            let mut salt = 0u64;
+            let p = loop {
+                let p = cache_path(self.dir.path(), &key, salt);
+                if !files.values().any(|existing| existing == &p) {
+                    break p;
+                }
+                salt += 1;
+            };
+            tmp.into_temp_path()
+                .persist_noclobber(&p)
+                .map_err(|e| EngineError::Io(e.error).with_path(&p))?;
             s = Source::open(&p)?;
             files.insert(key, p);
         }
@@ -363,7 +406,8 @@ impl Cache {
     }
     pub fn extract(&self, root: &Path, chain: &Chain, dest: &Path) -> Result<()> {
         let mut s = self.read_entry(root, chain)?;
-        let mut f = File::create(dest).map_err(|e| EngineError::from(e).with_path(dest))?;
+        let dest = creation_path(dest)?;
+        let mut f = File::create(&dest).map_err(|e| EngineError::from(e).with_path(&dest))?;
         splice::copy(&mut s, &mut f, &CancelToken::default())?;
         Ok(())
     }
@@ -1115,6 +1159,68 @@ fn preserve_metadata(_source: &Path, _dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_archive_chain_uses_short_cache_paths() {
+        let dir = session_tempdir().unwrap();
+        let root = dir.path().join("root.zip");
+        let name = format!("{}/boot.jar", "component/".repeat(40));
+        assert!(name.len() > 300);
+        let mut z = zip::ZipWriter::new(File::create(&root).unwrap());
+        z.start_file(
+            &name,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )
+        .unwrap();
+        z.write_all(b"inflated content").unwrap();
+        z.finish().unwrap();
+        let cache = Cache::new().unwrap();
+        for _ in 0..2 {
+            let mut source = cache
+                .open(
+                    &root,
+                    &Chain(vec![name.clone()]),
+                    &|_| {},
+                    &CancelToken::default(),
+                )
+                .unwrap();
+            let mut data = Vec::new();
+            source.read_to_end(&mut data).unwrap();
+            assert_eq!(data, b"inflated content");
+        }
+        let files = cache.files.lock().unwrap();
+        assert_eq!(files.len(), 1);
+        let path = files.values().next().unwrap();
+        assert_eq!(path.file_name().unwrap().to_string_lossy().len(), 20);
+        // A representative Windows TEMP root, independent of the test runner's TEMP.
+        let windows = Path::new(r"C:\Users\example\AppData\Local\Temp\zr-123456");
+        assert!(cache_path(windows, &name, 0).to_string_lossy().len() < 120);
+        assert_ne!(cache_path(windows, &name, 0), cache_path(windows, &name, 1));
+        assert_ne!(
+            cache_path(windows, &name, 0),
+            cache_path(windows, "other", 0)
+        );
+        drop(files);
+        cache.clear().unwrap();
+        assert_eq!(fs::read_dir(cache.dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn creates_files_beyond_max_path() {
+        let dir = session_tempdir().unwrap();
+        assert!(dir.path().to_string_lossy().starts_with(r"\\?\"));
+        let mut parent = dir.path().to_path_buf();
+        for _ in 0..8 {
+            parent.push("long-directory-name-for-path-regression");
+        }
+        fs::create_dir_all(&parent).unwrap();
+        let path = creation_path(&parent.join("output.bin")).unwrap();
+        assert!(path.as_os_str().len() > 260);
+        fs::write(&path, b"ok").unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"ok");
+    }
+
     #[test]
     fn verification_failure_keeps_original() {
         let dir = tempfile::tempdir().unwrap();
