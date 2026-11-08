@@ -153,6 +153,8 @@ impl Seek for Source {
         Ok(self.pos)
     }
 }
+// Cache only owns paths and metadata; each operation opens its own Source.
+// Callers must drop returned Sources before starting a mutation.
 pub struct Cache {
     dir: tempfile::TempDir,
     files: Mutex<BTreeMap<String, PathBuf>>,
@@ -241,7 +243,11 @@ impl Cache {
             if n != rec.size || h.finalize() != rec.crc() {
                 return Err(EngineError::VerifyFailed("inflate CRC/size".into()));
             }
-            let (_, p) = tmp.keep().map_err(|e| EngineError::Io(e.error))?;
+            drop(decoder);
+            let p = tmp
+                .into_temp_path()
+                .keep()
+                .map_err(|e| EngineError::Io(e.error))?;
             s = Source::open(&p)?;
             files.insert(key, p);
         }
@@ -430,6 +436,28 @@ fn signed(d: &Directory) -> bool {
         })
     })
 }
+/// A no-sharing probe must never overlap engine-owned readers. Its handle is
+/// released here, before callers read, back up, or replace the archive.
+pub(crate) fn probe_lock(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(path)
+            .map_err(|e| match e.raw_os_error() {
+                Some(32 | 33) => EngineError::FileLocked,
+                _ => EngineError::Io(e),
+            })?;
+        drop(probe);
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    Ok(())
+}
+
 pub fn apply(
     plan: &Plan,
     opts: &ApplyOptions,
@@ -445,21 +473,13 @@ pub fn apply(
     };
     let progress: &dyn Progress = &timing;
     let began = Instant::now();
+    // Probe before opening any readers, and close the probe before doing work.
+    probe_lock(&plan.root)?;
     let root = plan.root.canonicalize()?;
     let parent = root
         .parent()
         .ok_or_else(|| EngineError::Invalid("root parent".into()))?;
     let meta = fs::metadata(&root)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(0)
-            .open(&root)
-            .map_err(|_| EngineError::FileLocked)?;
-    }
     if fs2::available_space(parent)? < meta.len().saturating_mul(if opts.backup { 3 } else { 2 }) {
         return Err(EngineError::NoSpace);
     }
@@ -609,15 +629,18 @@ pub fn apply(
                 let _ = tmp.as_file_mut().write_all(b"BAD!");
             }
         });
+        drop(s);
+        tmp.as_file().sync_all()?;
+        let tmp = tmp.into_temp_path();
         event(
             progress,
             Phase::Verify,
             &chain,
             0,
-            tmp.as_file().metadata()?.len(),
+            fs::metadata(&tmp)?.len(),
         );
         let verify_start = Instant::now();
-        verify(tmp.path(), &changes, cancel)?;
+        verify(&tmp, &changes, cancel)?;
         *report.durations_ms.entry("verify".into()).or_default() +=
             verify_start.elapsed().as_millis();
         report.rewritten_chains.push(chain.clone());
@@ -636,7 +659,7 @@ pub fn apply(
             .insert(
                 name,
                 Change {
-                    source: tmp.path().to_owned(),
+                    source: tmp.to_path_buf(),
                 },
             )
             .is_some()
@@ -659,9 +682,16 @@ pub fn apply(
         .insert("inflate".into(), timing.milliseconds.get());
     if let Some(tmp) = final_file {
         cancel.check()?;
-        tmp.as_file().set_permissions(meta.permissions())?;
-        preserve_metadata(&root, tmp.path())?;
-        tmp.as_file().sync_all()?;
+        {
+            // FlushFileBuffers requires write access on Windows. Open before
+            // restoring permissions, then close before backup or replacement.
+            let sync_file = fs::OpenOptions::new().write(true).open(&tmp)?;
+            fs::set_permissions(&tmp, meta.permissions())?;
+            preserve_metadata(&root, &tmp)?;
+            sync_file.sync_all()?;
+        }
+        // Nested outputs are no longer needed; none retain an open handle.
+        drop(temps);
         let stamp = chrono::Local::now();
         let suffix = filename_timestamp(stamp);
         event(progress, Phase::Commit, &Chain::default(), 0, meta.len());
@@ -692,9 +722,11 @@ pub fn apply(
                             .open(&path)
                         {
                             Ok(mut f) => {
-                                if let Err(e) = std::io::copy(&mut File::open(&root)?, &mut f)
-                                    .and_then(|_| f.sync_all())
-                                {
+                                let copied = File::open(&root)
+                                    .and_then(|mut source| std::io::copy(&mut source, &mut f))
+                                    .and_then(|_| f.sync_all());
+                                drop(f);
+                                if let Err(e) = copied {
                                     let _ = fs::remove_file(&path);
                                     return Err(e.into());
                                 }
@@ -731,7 +763,8 @@ pub fn apply(
             serde_json::to_writer_pretty(&mut log, &report)
                 .map_err(|e| EngineError::Invalid(e.to_string()))?;
             log.as_file().sync_all()?;
-            log.persist_noclobber(&path)
+            log.into_temp_path()
+                .persist_noclobber(&path)
                 .map_err(|e| EngineError::Io(e.error))?;
             log_guard = Some(path);
         }
@@ -814,7 +847,7 @@ fn verify(path: &Path, changes: &BTreeMap<String, Change>, cancel: &CancelToken)
 fn prepare_additions(
     src: &mut Source,
     changes: &mut BTreeMap<String, Change>,
-    temps: &mut Vec<tempfile::NamedTempFile>,
+    temps: &mut Vec<tempfile::TempPath>,
     cancel: &CancelToken,
 ) -> Result<()> {
     let d = Directory::read(src)?;
@@ -840,7 +873,7 @@ fn prepare_additions(
                             source: f.path().to_owned(),
                         },
                     );
-                    temps.push(f);
+                    temps.push(f.into_temp_path());
                 }
             }
         }
@@ -917,7 +950,7 @@ fn prepare_additions(
                     source: f.path().to_owned(),
                 },
             );
-            temps.push(f);
+            temps.push(f.into_temp_path());
         }
     }
     Ok(())
@@ -974,20 +1007,15 @@ impl<W: Write> Write for ProgressWriter<'_, W> {
 #[cfg(test)]
 thread_local! {static CORRUPT_OUTPUT: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};}
 #[cfg(not(windows))]
-fn commit_file(tmp: tempfile::NamedTempFile, root: &Path) -> Result<()> {
+fn commit_file(tmp: tempfile::TempPath, root: &Path) -> Result<()> {
     tmp.persist(root).map_err(|e| EngineError::Io(e.error))?;
     Ok(())
 }
 #[cfg(windows)]
-fn commit_file(tmp: tempfile::NamedTempFile, root: &Path) -> Result<()> {
+fn commit_file(tmp: tempfile::TempPath, root: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     let root: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
-    let source: Vec<u16> = tmp
-        .path()
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    let source: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
     // ReplaceFileW merges the replaced file's security descriptor and streams.
     // Both pointers are NUL-terminated and remain live throughout the call.
     let ok = unsafe {

@@ -359,6 +359,7 @@ pub fn get(expr: &ZipExpr, config: &Config) -> Result<Vec<u8>> {
 }
 
 pub fn delete(expr: &ZipExpr, config: &Config) -> Result<()> {
+    crate::engine::probe_lock(&expr.root_archive)?;
     let source_bytes = fs::read(&expr.root_archive)?;
     let (next, changed) =
         mutate_archive_bytes(&source_bytes, &expr.segments, Mutation::Delete, config)?;
@@ -522,6 +523,7 @@ pub fn patch_apply_spec(
         return Ok(summary);
     }
 
+    crate::engine::probe_lock(archive_path)?;
     let (next_path, changed) = mutate_archive_file_planned(archive_path, &plan, config)?;
     if !changed && !spec.entry.is_empty() {
         let _ = fs::remove_file(&next_path);
@@ -778,6 +780,9 @@ pub fn restore_backup(archive_path: &Path, backup_path: &Path) -> Result<()> {
             backup_path.display(),
             archive_path.display()
         );
+    }
+    if archive_path.exists() {
+        crate::engine::probe_lock(archive_path)?;
     }
     let bytes = fs::read(backup_path)
         .with_context(|| format!("failed to read backup `{}`", backup_path.display()))?;
@@ -1084,6 +1089,7 @@ fn mutate_archive_file_planned(
         changed
     };
 
+    drop(src_archive);
     tf.flush()?;
     let persisted = tf.into_temp_path().keep()?;
     Ok((persisted, changed))

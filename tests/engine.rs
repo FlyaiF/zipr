@@ -795,3 +795,84 @@ fn backup_and_patch_log_use_local_transaction_time() {
     assert!(parsed <= after.naive_local());
     assert!(log.starts_with(&format!("root.zip.patch-{stamp}-")));
 }
+
+#[cfg(windows)]
+#[test]
+fn foreign_exclusive_handle_is_locked_but_idle_cache_is_not() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use zip::CompressionMethod::{Deflated, Stored};
+
+    for method in [Stored, Deflated] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.zip");
+        let inner = archive(&[("x", b"old", method)]);
+        let original = archive(&[("inner.jar", &inner, method)]);
+        fs::write(&root, &original).unwrap();
+        let source = dir.path().join("patch");
+        fs::write(&source, b"new payload").unwrap();
+        let cache = Cache::new().unwrap();
+        let target = Chain::from("inner.jar!/x");
+        cache.list_children(&root, &Chain::default()).unwrap();
+        cache
+            .list_children(&root, &Chain::from("inner.jar"))
+            .unwrap();
+        let mut bytes = Vec::new();
+        cache
+            .read_entry(&root, &target)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"old");
+
+        // This handle is foreign to the engine. Acquiring it also proves that
+        // list/read/inflate left no root handle in the still-live cache.
+        let foreign = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&root)
+            .unwrap();
+        let plan = Plan {
+            root: root.clone(),
+            ops: vec![Op::Replace { target, source }],
+        };
+        let result = apply(
+            &plan,
+            &ApplyOptions::default(),
+            &cache,
+            &|_| {},
+            &CancelToken::default(),
+        );
+        assert!(matches!(result, Err(EngineError::FileLocked)), "{result:?}");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+        drop(foreign);
+        assert_eq!(fs::read(&root).unwrap(), original);
+
+        let report = apply(
+            &plan,
+            &ApplyOptions::default(),
+            &cache,
+            &|_| {},
+            &CancelToken::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            get(&get(&fs::read(&root).unwrap(), "inner.jar"), "x"),
+            b"new payload"
+        );
+        let backup = report.backup_path.unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        zipr_lib::archive::restore_backup(&root, &backup).unwrap();
+        assert_eq!(fs::read(&root).unwrap(), original);
+        assert!(!backup.exists());
+        cache.clear().unwrap();
+        // Successful commit/restore also leave no handles on the root or log.
+        let exclusive = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&root)
+            .unwrap();
+        drop(exclusive);
+        fs::remove_file(&root).unwrap();
+        fs::remove_file(report.log_path.unwrap()).unwrap();
+    }
+}
