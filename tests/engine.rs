@@ -933,5 +933,23 @@ fn io_error_serialization_keeps_path_and_original_os_message() {
     let value = serde_json::to_value(error).unwrap();
     assert_eq!(value["kind"], "io");
     assert_eq!(value["paths"][0], "missing.zip");
+    assert_eq!(value["io_kind"], "NotFound");
+    assert_eq!(value["os_message"], original);
     assert!(value["message"].as_str().unwrap().contains(&original));
+}
+
+#[test]
+fn io_kind_survives_wrapping_without_parsing_os_messages() {
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::Other,
+    ] {
+        let error = EngineError::from(std::io::Error::new(kind, "localized diagnostic"))
+            .with_path("output.zip")
+            .with_path("input.zip");
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["io_kind"], format!("{kind:?}"));
+        assert_eq!(value["os_message"], "localized diagnostic");
+        assert_eq!(value["paths"][0], "output.zip");
+    }
 }

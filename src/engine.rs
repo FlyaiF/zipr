@@ -65,6 +65,8 @@ impl Serialize for EngineError {
             "EngineError",
             if matches!(self, Self::Corrupt { .. }) {
                 4
+            } else if matches!(self, Self::Io(_)) {
+                5
             } else {
                 3
             },
@@ -91,6 +93,10 @@ impl Serialize for EngineError {
                 _ => None,
             },
         )?;
+        if let Self::Io(error) = self {
+            v.serialize_field("io_kind", &format!("{:?}", error.kind()))?;
+            v.serialize_field("os_message", &error.to_string())?;
+        }
         if let Self::Corrupt { detail, .. } = self {
             v.serialize_field("detail", detail)?;
         }
