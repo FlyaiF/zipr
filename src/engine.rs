@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -24,6 +24,8 @@ pub enum EngineError {
     Io(#[from] std::io::Error),
     #[error("invalid archive or plan: {0}")]
     Invalid(String),
+    #[error("corrupt archive {chain:?}: {detail}")]
+    Corrupt { chain: Chain, detail: String },
     #[error("signed jar cannot be modified: {chain:?}")]
     SignedJar { chain: Chain },
     #[error("file in use")]
@@ -59,13 +61,21 @@ impl Serialize for EngineError {
             value["message"] = serde_json::json!(self.to_string());
             return value.serialize(s);
         }
-        let mut v = s.serialize_struct("EngineError", 3)?;
+        let mut v = s.serialize_struct(
+            "EngineError",
+            if matches!(self, Self::Corrupt { .. }) {
+                4
+            } else {
+                3
+            },
+        )?;
         v.serialize_field(
             "kind",
             match self {
                 Self::Io(_) => "io",
                 Self::AtPath { .. } => "unknown",
                 Self::Invalid(_) => "invalid",
+                Self::Corrupt { .. } => "corrupt",
                 Self::SignedJar { .. } => "signed_jar",
                 Self::FileLocked => "file_locked",
                 Self::NoSpace => "no_space",
@@ -77,10 +87,13 @@ impl Serialize for EngineError {
         v.serialize_field(
             "chain",
             &match self {
-                Self::SignedJar { chain } => Some(chain),
+                Self::SignedJar { chain } | Self::Corrupt { chain, .. } => Some(chain),
                 _ => None,
             },
         )?;
+        if let Self::Corrupt { detail, .. } = self {
+            v.serialize_field("detail", detail)?;
+        }
         v.end()
     }
 }
@@ -215,15 +228,23 @@ fn cache_path(dir: &Path, key: &str, salt: u64) -> PathBuf {
 // Cache only owns paths and metadata; each operation opens its own Source.
 // Callers must drop returned Sources before starting a mutation.
 pub struct Cache {
+    crc_nanos: AtomicU64,
+    crc_bytes: AtomicU64,
     dir: tempfile::TempDir,
     files: Mutex<BTreeMap<String, PathBuf>>,
+    verified: Mutex<BTreeMap<String, std::result::Result<(), String>>>,
+    problems: Mutex<BTreeMap<Chain, String>>,
     signatures: Mutex<BTreeMap<String, bool>>,
 }
 impl Cache {
     pub fn new() -> Result<Self> {
         Ok(Self {
+            crc_nanos: AtomicU64::new(0),
+            crc_bytes: AtomicU64::new(0),
             dir: session_tempdir()?,
             files: Mutex::new(BTreeMap::new()),
+            verified: Mutex::new(BTreeMap::new()),
+            problems: Mutex::new(BTreeMap::new()),
             signatures: Mutex::new(BTreeMap::new()),
         })
     }
@@ -236,11 +257,48 @@ impl Cache {
             fs::remove_file(p)?;
         }
         files.clear();
+        self.verified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.problems
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.signatures
             .lock()
             .map_err(|_| EngineError::Invalid("cache lock".into()))?
             .clear();
         Ok(())
+    }
+    /// Cumulative cost of first-access STORED CRC verification in this session.
+    pub fn crc_metrics(&self) -> (u64, u64) {
+        (
+            self.crc_bytes.load(Ordering::Relaxed),
+            self.crc_nanos.load(Ordering::Relaxed),
+        )
+    }
+    pub fn problems(&self) -> Vec<CorruptArchive> {
+        self.problems
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(chain, detail)| CorruptArchive {
+                chain: chain.clone(),
+                detail: detail.clone(),
+            })
+            .collect()
+    }
+    pub(crate) fn corrupt(&self, chain: &Chain, detail: impl ToString) -> EngineError {
+        let detail = detail.to_string();
+        self.problems
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(chain.clone(), detail.clone());
+        EngineError::Corrupt {
+            chain: chain.clone(),
+            detail,
+        }
     }
     pub fn open(
         &self,
@@ -258,14 +316,54 @@ impl Cache {
         for name in &chain.0 {
             cancel.check()?;
             path.0.push(name.clone());
-            let d = Directory::read(&mut s)?;
+            let d = Directory::read(&mut s)
+                .map_err(|e| self.corrupt(&Chain(path.0[..path.0.len() - 1].to_vec()), e))?;
             let rec = d
                 .records
                 .iter()
                 .find(|r| r.name == *name)
                 .ok_or_else(|| EngineError::Invalid(format!("entry not found: {name}")))?;
-            let at = rec.data_offset(&mut s)?;
+            let at = rec
+                .data_offset(&mut s)
+                .map_err(|e| self.corrupt(&path, e))?;
+            let key = format!("{root:?}:{}:{:?}:{path:?}", meta.len(), meta.modified()?);
             if rec.method() == 0 {
+                // Verify a seek view only when first accessed, then reuse the result.
+                let mut verified = self
+                    .verified
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let result = if let Some(result) = verified.get(&key) {
+                    result.clone()
+                } else {
+                    let began = Instant::now();
+                    s.seek(SeekFrom::Start(at))?;
+                    let mut remaining = rec.size;
+                    let mut hash = crc32fast::Hasher::new();
+                    let mut buffer = [0; 128 * 1024];
+                    while remaining > 0 {
+                        cancel.check()?;
+                        let limit = remaining.min(buffer.len() as u64) as usize;
+                        let n = s.read(&mut buffer[..limit])?;
+                        if n == 0 {
+                            break;
+                        }
+                        hash.update(&buffer[..n]);
+                        remaining -= n as u64;
+                    }
+                    let result = if remaining != 0 || hash.finalize() != rec.crc() {
+                        Err("CRC/size mismatch".to_owned())
+                    } else {
+                        Ok(())
+                    };
+                    self.crc_nanos
+                        .fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    self.crc_bytes
+                        .fetch_add(rec.size - remaining, Ordering::Relaxed);
+                    verified.insert(key.clone(), result.clone());
+                    result
+                };
+                result.map_err(|detail| self.corrupt(&path, detail))?;
                 s.start += at;
                 s.len = rec.size;
                 s.pos = 0;
@@ -274,7 +372,6 @@ impl Cache {
             if rec.method() != 8 {
                 return Err(EngineError::Invalid("unsupported compression".into()));
             }
-            let key = format!("{root:?}:{}:{:?}:{path:?}", meta.len(), meta.modified()?);
             let mut files = self
                 .files
                 .lock()
@@ -294,7 +391,7 @@ impl Cache {
             let mut b = [0; 128 * 1024];
             loop {
                 cancel.check()?;
-                let k = decoder.read(&mut b)?;
+                let k = decoder.read(&mut b).map_err(|e| self.corrupt(&path, e))?;
                 if k == 0 {
                     break;
                 }
@@ -305,7 +402,7 @@ impl Cache {
                 event(progress, Phase::Inflate, &path, n, rec.size);
             }
             if n != rec.size || h.finalize() != rec.crc() {
-                return Err(EngineError::VerifyFailed("inflate CRC/size".into()));
+                return Err(self.corrupt(&path, "CRC/size mismatch"));
             }
             drop(decoder);
             // The logical key stays in memory; no archive names enter filesystem paths.
@@ -350,11 +447,21 @@ impl Cache {
             .signatures
             .lock()
             .map_err(|_| EngineError::Invalid("cache lock".into()))?;
-        Ok(Directory::read(&mut s)?
+        Ok(Directory::read(&mut s)
+            .map_err(|e| self.corrupt(&archive, e))?
             .records
             .into_iter()
             .filter(|r| r.name.starts_with(&prefix) && r.name != prefix)
             .map(|r| EntryInfo {
+                corrupt: {
+                    let mut child = archive.clone();
+                    child.0.push(r.name.clone());
+                    self.problems
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&child)
+                        .cloned()
+                },
                 name: r.name.clone(),
                 raw_name: r.raw_name.clone(),
                 name_is_utf8: std::str::from_utf8(&r.raw_name).is_ok(),
@@ -394,7 +501,7 @@ impl Cache {
             meta.modified()?
         );
         let mut source = self.open(root, chain, &|_| {}, &CancelToken::default())?;
-        let value = signed(&Directory::read(&mut source)?);
+        let value = signed(&Directory::read(&mut source).map_err(|e| self.corrupt(chain, e))?);
         self.signatures
             .lock()
             .map_err(|_| EngineError::Invalid("cache lock".into()))?
@@ -417,8 +524,14 @@ fn is_archive(n: &str) -> bool {
         .iter()
         .any(|e| n.to_ascii_lowercase().ends_with(e))
 }
+#[derive(Clone, Debug, Serialize)]
+pub struct CorruptArchive {
+    pub chain: Chain,
+    pub detail: String,
+}
 #[derive(Debug, Serialize)]
 pub struct EntryInfo {
+    pub corrupt: Option<String>,
     pub name: String,
     pub raw_name: Vec<u8>,
     pub name_is_utf8: bool,
@@ -628,7 +741,7 @@ pub fn apply(
         for depth in 0..=chain.0.len() {
             let ancestor = Chain(chain.0[..depth].to_vec());
             let mut s = cache.open(&root, &ancestor, progress, cancel)?;
-            let d = Directory::read(&mut s)?;
+            let d = Directory::read(&mut s).map_err(|e| cache.corrupt(&ancestor, e))?;
             if signed(&d) {
                 return Err(EngineError::SignedJar { chain: ancestor });
             }

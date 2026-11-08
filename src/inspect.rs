@@ -105,8 +105,11 @@ impl Cache {
         let mut todo = vec![chain.clone()];
         while let Some(parent) = todo.pop() {
             cancel.check()?;
-            let mut src = self.open(root, &parent, progress, cancel)?;
-            let entries = crate::splice::Directory::read(&mut src)?.records;
+            let entries = match self.list_children_with_progress(root, &parent, progress, cancel) {
+                Ok(entries) => entries,
+                Err(EngineError::Corrupt { .. }) if !parent.0.is_empty() => continue,
+                Err(error) => return Err(error),
+            };
             for r in entries {
                 cancel.check()?;
                 let mut target = parent.clone();
