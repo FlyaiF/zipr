@@ -68,6 +68,17 @@ mod tests {
     use super::parse_zip_expr;
 
     #[test]
+    fn parses_windows_roots_and_normalizes_entry_separators() {
+        for root in [r"C:\Users\x\outer.zip", r"\\server\share\outer.zip"] {
+            let expr = parse_zip_expr(&format!("{root}!/lib\\inner.jar!/dir\\a.txt"))
+                .expect("parse Windows expression");
+            assert_eq!(expr.root_archive, std::path::Path::new(root));
+            assert_eq!(expr.archive_chain(), &["lib/inner.jar"]);
+            assert_eq!(expr.target().expect("target"), "dir/a.txt");
+        }
+    }
+
+    #[test]
     fn parse_basic() {
         let expr = parse_zip_expr("a.zip!/x.txt").expect("parse");
         assert_eq!(expr.root_archive.to_string_lossy(), "a.zip");

@@ -204,6 +204,40 @@ mod tests {
     use super::{LevelPolicy, PatchSpec};
 
     #[test]
+    fn draft_round_trips_windows_paths() -> anyhow::Result<()> {
+        let archive = r"C:\Users\x\outer.zip";
+        let source = r"C:\Users\x\patches\a.txt";
+        let target = format!("{archive}!/inner.jar!/dir/a.txt");
+        let mut spec = PatchSpec {
+            version: 1,
+            archive: Some(archive.to_owned()),
+            generated_at: None,
+            entry: vec![],
+            unresolved: vec![],
+        };
+        spec.resolve_entry(source, Some(&target));
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("draft.toml");
+        spec.write_to_file(&path)?;
+        let restored = PatchSpec::read_from_file(&path)?;
+        assert_eq!(restored.archive.as_deref(), Some(archive));
+        assert_eq!(restored.entry[0].source.as_deref(), Some(source));
+        assert_eq!(restored.entry[0].target, target);
+        let expr = crate::path_expr::parse_zip_expr(&restored.entry[0].target)?;
+        assert_eq!(expr.root_archive, std::path::Path::new(archive));
+        assert_eq!(expr.archive_chain(), &["inner.jar"]);
+        assert_eq!(expr.target()?, "dir/a.txt");
+        assert_eq!(
+            crate::archive::strip_root_from_target(
+                std::path::Path::new("C:/Users/x/outer.zip"),
+                &restored.entry[0].target,
+            ),
+            "inner.jar!/dir/a.txt"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn validate_level_range() {
         let raw = r#"
 version = 1

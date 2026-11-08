@@ -939,11 +939,14 @@ fn is_generated_patch_file(path: &Path) -> bool {
 }
 
 pub fn strip_root_from_target(root: &Path, target: &str) -> String {
+    // Draft targets may contain native Windows separators while the root uses
+    // ZIP separators. Normalize both before removing the archive prefix.
+    let target = target.replace('\\', "/");
     let normalized = normalize_path_for_zip(root);
     if let Some(tail) = target.strip_prefix(&format!("{normalized}!/")) {
         return tail.to_owned();
     }
-    if let Some(name) = root.file_name().and_then(|n| n.to_str())
+    if let Some(name) = normalized.rsplit('/').next()
         && let Some(tail) = target.strip_prefix(&format!("{name}!/"))
     {
         return tail.to_owned();
@@ -1332,4 +1335,44 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
 fn to_zip_time(st: SystemTime) -> Option<DateTime> {
     let odt: OffsetDateTime = st.into();
     DateTime::try_from(time::PrimitiveDateTime::new(odt.date(), odt.time())).ok()
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::strip_root_from_target;
+    use std::path::Path;
+
+    #[test]
+    fn strips_windows_roots_with_either_separator() {
+        for root in [
+            r"C:\Users\x\outer.zip",
+            r"\\server\share\outer.zip",
+            r"\\?\C:\Users\x\outer.zip",
+        ] {
+            for target_root in [root.to_owned(), root.replace('\\', "/")] {
+                let target = format!("{target_root}!/inner.jar!/dir\\file.txt");
+                assert_eq!(
+                    strip_root_from_target(Path::new(root), &target),
+                    "inner.jar!/dir/file.txt"
+                );
+            }
+            assert_eq!(
+                strip_root_from_target(Path::new(root), "outer.zip!/file.txt"),
+                "file.txt"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_relative_targets_and_other_archive_roots() {
+        let root = Path::new(r"C:\Users\x\outer.zip");
+        assert_eq!(
+            strip_root_from_target(root, "inner.jar!/file.txt"),
+            "inner.jar!/file.txt"
+        );
+        assert_eq!(
+            strip_root_from_target(root, "D:/other.zip!/file.txt"),
+            "D:/other.zip!/file.txt"
+        );
+    }
 }

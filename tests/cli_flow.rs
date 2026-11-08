@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use filetime::{FileTime, set_file_mtime};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use tempfile::tempdir;
 use zip::CompressionMethod;
 use zip::DateTime;
@@ -56,13 +56,13 @@ fn nested_list_get_replace_delete_flow() -> Result<()> {
     build_nested_archive(&archive)?;
 
     let output = bin_cmd(dir.path()).arg("list").arg(&archive).output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("!/inner.jar!/a.txt"));
 
     let expr = format!("{}!/inner.jar!/a.txt", archive.display());
     let output = bin_cmd(dir.path()).arg("get").arg(&expr).output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
     assert_eq!(output.stdout, b"inner-content");
 
     let replacement = dir.path().join("new-a.txt");
@@ -77,7 +77,7 @@ fn nested_list_get_replace_delete_flow() -> Result<()> {
         .arg(&expr)
         .arg(&replacement)
         .output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
     let top_meta_after = top_entry_meta(&archive, "top.txt")?;
     assert_eq!(top_meta_before.0, top_meta_after.0);
     assert_eq!(top_meta_before.1, top_meta_after.1);
@@ -87,15 +87,15 @@ fn nested_list_get_replace_delete_flow() -> Result<()> {
     assert_eq!(replaced_dt, expected_dt);
 
     let output = bin_cmd(dir.path()).arg("get").arg(&expr).output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
     assert_eq!(output.stdout, b"patched");
 
     let del_expr = format!("{}!/top.txt", archive.display());
     let output = bin_cmd(dir.path()).arg("delete").arg(&del_expr).output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
 
     let output = bin_cmd(dir.path()).arg("get").arg(&del_expr).output()?;
-    assert!(!output.status.success());
+    assert_status(&output, false);
     Ok(())
 }
 
@@ -118,7 +118,7 @@ fn patch_draft_and_apply() -> Result<()> {
         .arg("-o")
         .arg(&draft)
         .output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
     assert!(draft.exists());
 
     let output = bin_cmd(dir.path())
@@ -128,11 +128,11 @@ fn patch_draft_and_apply() -> Result<()> {
         .arg("--spec")
         .arg(&draft)
         .output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
 
     let expr = format!("{}!/inner.jar!/a.txt", archive.display());
     let output = bin_cmd(dir.path()).arg("get").arg(&expr).output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
     assert_eq!(output.stdout, b"from-patch");
     Ok(())
 }
@@ -158,7 +158,7 @@ fn patch_draft_ignores_generated_spec_files() -> Result<()> {
         .arg("-o")
         .arg(&draft)
         .output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
 
     let spec = fs::read_to_string(&draft)?;
     assert!(spec.contains("a.txt"));
@@ -233,7 +233,7 @@ fn diff_shows_added_removed_modified_and_metadata() -> Result<()> {
         .arg(&left)
         .arg(&right)
         .output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("M meta.txt"));
     assert!(stdout.contains("meta: method: Deflated -> Stored"));
@@ -266,13 +266,13 @@ fn fuzzy_replace_two_args_auto_applies_when_unambiguous() -> Result<()> {
         .arg(&archive)
         .arg(&replacement)
         .output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("applied: replaced=1"));
 
     let expr = format!("{}!/inner.jar!/a.txt", archive.display());
     let get = bin_cmd(dir.path()).arg("get").arg(&expr).output()?;
-    assert!(get.status.success());
+    assert_status(&get, true);
     assert_eq!(get.stdout, b"fuzzy-new");
     Ok(())
 }
@@ -296,7 +296,7 @@ fn fuzzy_replace_two_args_prompts_on_conflict() -> Result<()> {
     let mut child = child.spawn()?;
     child.stdin.as_mut().context("stdin")?.write_all(b"n\n")?;
     let output = child.wait_with_output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("Unresolved"));
     assert!(stdout.contains("Aborted"));
@@ -304,7 +304,7 @@ fn fuzzy_replace_two_args_prompts_on_conflict() -> Result<()> {
 
     let expr = format!("{}!/x/a.txt", archive.display());
     let get = bin_cmd(dir.path()).arg("get").arg(&expr).output()?;
-    assert!(get.status.success());
+    assert_status(&get, true);
     assert_eq!(get.stdout, b"left");
     Ok(())
 }
@@ -313,10 +313,22 @@ fn fuzzy_replace_two_args_prompts_on_conflict() -> Result<()> {
 fn no_args_shows_help_and_fails() -> Result<()> {
     let dir = tempdir()?;
     let output = bin_cmd(dir.path()).output()?;
-    assert!(!output.status.success());
+    assert_status(&output, false);
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.to_ascii_lowercase().contains("usage"));
     Ok(())
+}
+
+#[track_caller]
+fn assert_status(output: &Output, success: bool) {
+    assert_eq!(
+        output.status.success(),
+        success,
+        "unexpected exit status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 fn bin_cmd(cwd: &Path) -> Command {
@@ -364,7 +376,7 @@ fn json_list_and_patch_apply_are_machine_readable() -> Result<()> {
         .arg(&archive)
         .arg("--json")
         .output()?;
-    assert!(output.status.success());
+    assert_status(&output, true);
     let entries: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(entries.as_array().expect("entry array").len(), 2);
     fs::write(dir.path().join("source"), b"patched")?;
@@ -377,11 +389,7 @@ fn json_list_and_patch_apply_are_machine_readable() -> Result<()> {
         .arg(&archive)
         .args(["--spec", "patch.toml", "--json"])
         .output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, true);
     let summary: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(summary["replaced"], 1);
     assert!(summary["backup_path"].is_string());
@@ -417,7 +425,7 @@ fn legacy_patch_policy_overrides_are_rejected_without_writing() -> Result<()> {
                 cmd.arg("--dry-run");
             }
             let output = cmd.output()?;
-            assert!(!output.status.success());
+            assert_status(&output, false);
             assert!(
                 String::from_utf8_lossy(&output.stderr)
                     .contains("legacy policy overrides are no longer supported")
@@ -434,7 +442,7 @@ fn legacy_patch_policy_overrides_are_rejected_without_writing() -> Result<()> {
         .arg(&archive)
         .args(["--spec", "patch.toml"])
         .output()?;
-    assert!(!output.status.success());
+    assert_status(&output, false);
     assert!(String::from_utf8_lossy(&output.stderr).contains("mixed replace/delete"));
     assert_eq!(fs::read(&archive)?, before);
     assert_eq!(fs::read_dir(dir.path())?.count(), 3);
