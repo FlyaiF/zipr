@@ -70,7 +70,9 @@ fn nested_list_get_replace_delete_flow() -> Result<()> {
     let source_mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     set_file_mtime(&replacement, FileTime::from_system_time(source_mtime))?;
     let top_meta_before = top_entry_meta(&archive, "top.txt")?;
+    // DOS timestamps are local time; pin the child timezone for a deterministic assertion.
     let output = bin_cmd(dir.path())
+        .env("TZ", "UTC")
         .arg("replace")
         .arg(&expr)
         .arg(&replacement)
@@ -350,4 +352,91 @@ fn to_zip_dt(st: SystemTime) -> Result<DateTime> {
         odt.date(),
         odt.time(),
     ))?)
+}
+
+#[test]
+fn json_list_and_patch_apply_are_machine_readable() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("root.zip");
+    build_nested_archive(&archive)?;
+    let output = bin_cmd(dir.path())
+        .arg("list")
+        .arg(&archive)
+        .arg("--json")
+        .output()?;
+    assert!(output.status.success());
+    let entries: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(entries.as_array().expect("entry array").len(), 2);
+    fs::write(dir.path().join("source"), b"patched")?;
+    fs::write(
+        dir.path().join("patch.toml"),
+        "version = 1\n[[entry]]\ntarget = \"inner.jar!/a.txt\"\nsource = \"source\"\n",
+    )?;
+    let output = bin_cmd(dir.path())
+        .args(["patch", "apply"])
+        .arg(&archive)
+        .args(["--spec", "patch.toml", "--json"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(summary["replaced"], 1);
+    assert!(summary["backup_path"].is_string());
+    Ok(())
+}
+
+#[test]
+fn legacy_patch_policy_overrides_are_rejected_without_writing() -> Result<()> {
+    let dir = tempdir()?;
+    let archive = dir.path().join("root.zip");
+    build_nested_archive(&archive)?;
+    let before = fs::read(&archive)?;
+    fs::write(dir.path().join("source"), b"patch")?;
+    for policy in [
+        "method = \"stored\"",
+        "method = \"deflated\"",
+        "level = 9",
+        "mtime = \"keep\"",
+        "mtime = \"now\"",
+    ] {
+        fs::write(
+            dir.path().join("patch.toml"),
+            format!(
+                "version = 1\n[[entry]]\ntarget = \"top.txt\"\nsource = \"source\"\n{policy}\n"
+            ),
+        )?;
+        for dry in [false, true] {
+            let mut cmd = bin_cmd(dir.path());
+            cmd.args(["patch", "apply"])
+                .arg(&archive)
+                .args(["--spec", "patch.toml"]);
+            if dry {
+                cmd.arg("--dry-run");
+            }
+            let output = cmd.output()?;
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("legacy policy overrides are no longer supported")
+            );
+        }
+        assert_eq!(fs::read(&archive)?, before);
+    }
+    fs::write(
+        dir.path().join("patch.toml"),
+        "version = 1\n[[entry]]\ntarget = \"top.txt\"\nsource = \"source\"\n[[entry]]\ntarget = \"inner.jar\"\naction = \"delete\"\n",
+    )?;
+    let output = bin_cmd(dir.path())
+        .args(["patch", "apply"])
+        .arg(&archive)
+        .args(["--spec", "patch.toml"])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mixed replace/delete"));
+    assert_eq!(fs::read(&archive)?, before);
+    assert_eq!(fs::read_dir(dir.path())?.count(), 3);
+    Ok(())
 }

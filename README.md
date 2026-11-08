@@ -78,7 +78,8 @@ cargo run -- --archive-ext zip,jar,war,ear list a.ear
 ## 5. 注意事项
 - 嵌套路径统一使用 `!/`，例如：`outer.jar!/inner.jar!/a.txt`。
 - 修改操作会使用当前目录临时文件并原子替换，降低损坏风险。
-- `method=inherit` 时会保留原条目的压缩方法（`STORED/DEFLATED`）。
+- 替换操作仅支持 `method=inherit`、`level=inherit/default`（DEFLATE level 6）、`mtime=source`；旧的覆盖选项会报错，不再退回旧写入器。
+- 替换与删除不能混在同一个 patch 清单中；删除请单独执行。
 
 ## 6. 分发打包
 ```bash

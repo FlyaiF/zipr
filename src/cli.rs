@@ -39,6 +39,8 @@ pub struct Cli {
 enum Cmd {
     List {
         archive: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     Get {
         zip_expr: String,
@@ -78,6 +80,8 @@ enum PatchCmd {
         spec: PathBuf,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -86,7 +90,19 @@ pub fn run() -> Result<()> {
     let config = Config::load(cli.archive_ext.as_deref())?;
 
     match cli.cmd {
-        Some(Cmd::List { archive }) => run_list(&archive, &config)?,
+        Some(Cmd::List { archive, json }) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &zipr_lib::engine::Cache::new()?
+                            .list_children(&archive, &zipr_lib::engine::Chain::default())?
+                    )?
+                );
+            } else {
+                run_list(&archive, &config)?;
+            }
+        }
         Some(Cmd::Get { zip_expr, out }) => run_get(&zip_expr, out.as_deref(), &config)?,
         Some(Cmd::Delete { zip_expr }) => run_delete(&zip_expr, &config)?,
         Some(Cmd::Replace { zip_expr, source }) => run_replace(&zip_expr, &source, &config)?,
@@ -274,8 +290,13 @@ fn run_patch(cmd: PatchCmd, config: &Config) -> Result<()> {
             archive,
             spec,
             dry_run,
+            json,
         } => {
             let summary = archive::patch_apply(&archive, &spec, dry_run, config)?;
+            if json {
+                println!("{}", serde_json::to_string(&summary)?);
+                return Ok(());
+            }
             println!(
                 "patch {}: replaced={}, deleted={}, elapsed_ms={}",
                 if dry_run { "dry-run" } else { "applied" },

@@ -135,8 +135,22 @@ impl PatchSpec {
             bail!("patch spec contains unresolved entries; fix or remove them before apply");
         }
 
+        if self.entry.iter().any(|e| e.action == Action::Replace)
+            && self.entry.iter().any(|e| e.action == Action::Delete)
+        {
+            bail!("mixed replace/delete plans are no longer supported; run deletion separately");
+        }
         let mut seen = HashSet::new();
         for e in &self.entry {
+            if e.method != MethodPolicy::Inherit
+                || !matches!(e.level, LevelPolicy::Name(_))
+                || e.mtime != MtimePolicy::Source
+            {
+                bail!(
+                    "legacy policy overrides are no longer supported: use method=inherit, level=inherit (or default), mtime=source"
+                );
+            }
+
             if !seen.insert(e.target.clone()) {
                 bail!("duplicate target in patch spec: {}", e.target);
             }

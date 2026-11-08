@@ -25,7 +25,7 @@ struct DraftInput {
     base: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ListedEntry {
     pub expr: String,
     pub size: u64,
@@ -58,7 +58,7 @@ pub struct DraftSummary {
     pub unresolved: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ApplySummary {
     pub replaced: usize,
     pub deleted: usize,
@@ -368,21 +368,35 @@ pub fn delete(expr: &ZipExpr, config: &Config) -> Result<()> {
     write_atomically(&expr.root_archive, &next)
 }
 
-pub fn replace(expr: &ZipExpr, source: &Path, config: &Config, opts: ReplaceOptions) -> Result<()> {
-    let source_bytes = fs::read(source)?;
-    let source_meta = fs::metadata(source).ok();
-    let source_mtime = source_meta.and_then(|m| m.modified().ok());
-    let mutation = Mutation::Replace {
-        bytes: source_bytes,
-        opts,
-        source_mtime,
-    };
-    let original = fs::read(&expr.root_archive)?;
-    let (next, changed) = mutate_archive_bytes(&original, &expr.segments, mutation, config)?;
-    if !changed {
-        bail!("target entry not found: {}", expr.target()?);
+pub fn replace(
+    expr: &ZipExpr,
+    source: &Path,
+    _config: &Config,
+    opts: ReplaceOptions,
+) -> Result<()> {
+    if opts.method != MethodPolicy::Inherit
+        || !matches!(opts.level, LevelPolicy::Name(_))
+        || opts.mtime != MtimePolicy::Source
+    {
+        bail!(
+            "legacy policy overrides are no longer supported: use method=inherit, level=inherit (or default), mtime=source"
+        );
     }
-    write_atomically(&expr.root_archive, &next)
+    use crate::engine::{self, ApplyOptions, Cache, CancelToken, Chain, Op, Plan};
+    engine::apply(
+        &Plan {
+            root: expr.root_archive.clone(),
+            ops: vec![Op::Replace {
+                target: Chain(expr.segments.clone()),
+                source: source.to_owned(),
+            }],
+        },
+        &ApplyOptions::default(),
+        &Cache::new()?,
+        &|_| {},
+        &CancelToken::default(),
+    )?;
+    Ok(())
 }
 
 pub fn patch_draft(
@@ -473,6 +487,34 @@ pub fn patch_apply_spec(
         return Ok(summary);
     }
 
+    if !dry_run && spec.entry.iter().all(|e| e.action == Action::Replace) {
+        use crate::engine::{self, ApplyOptions, Cache, CancelToken, Chain, Op, Plan};
+        let ops = spec
+            .entry
+            .iter()
+            .map(|e| {
+                Ok(Op::Replace {
+                    target: Chain::from(strip_root_from_target(archive_path, &e.target).as_str()),
+                    source: PathBuf::from(
+                        e.source.as_ref().ok_or_else(|| anyhow!("missing source"))?,
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let report = engine::apply(
+            &Plan {
+                root: archive_path.to_owned(),
+                ops,
+            },
+            &ApplyOptions::default(),
+            &Cache::new()?,
+            &|_| {},
+            &CancelToken::default(),
+        )?;
+        summary.backup_path = report.backup_path.map(|p| normalize_path_for_zip(&p));
+        summary.elapsed_ms = started.elapsed().as_millis();
+        return Ok(summary);
+    }
     let plan = build_patch_plan(archive_path, spec, !dry_run)?;
     if dry_run {
         validate_patch_plan_targets(archive_path, &plan, config)?;
@@ -538,7 +580,7 @@ fn build_patch_plan(
     for e in &spec.entry {
         let expr = parse_zip_expr(&format!(
             "{archive_root}!/{target}",
-            target = strip_root_from_target(&e.target)
+            target = strip_root_from_target(archive_path, &e.target)
         ))?;
         let mutation = match e.action {
             Action::Delete => Mutation::Delete,
@@ -710,17 +752,7 @@ fn write_backup(archive_path: &Path) -> Result<PathBuf> {
 }
 
 fn backup_path_for(archive_path: &Path, attempt: u16) -> PathBuf {
-    let now = OffsetDateTime::now_utc();
-    let stamp = format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}.{:09}Z",
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second(),
-        now.nanosecond()
-    );
+    let stamp = crate::engine::filename_timestamp(chrono::Local::now());
     let mut path = archive_path.as_os_str().to_os_string();
     if attempt == 0 {
         path.push(format!(".bak-{stamp}"));
@@ -740,7 +772,7 @@ pub fn restore_backup(archive_path: &Path, backup_path: &Path) -> Result<()> {
     }
     let archive_parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
     let backup_parent = backup_path.parent().unwrap_or_else(|| Path::new("."));
-    if archive_parent != backup_parent {
+    if archive_parent.canonicalize()? != backup_parent.canonicalize()? {
         bail!(
             "backup `{}` must live next to archive `{}`",
             backup_path.display(),
@@ -901,12 +933,17 @@ fn is_generated_patch_file(path: &Path) -> bool {
     )
 }
 
-fn strip_root_from_target(target: &str) -> String {
-    if let Some((_, tail)) = target.split_once("!/") {
-        tail.to_string()
-    } else {
-        target.to_string()
+pub fn strip_root_from_target(root: &Path, target: &str) -> String {
+    let normalized = normalize_path_for_zip(root);
+    if let Some(tail) = target.strip_prefix(&format!("{normalized}!/")) {
+        return tail.to_owned();
     }
+    if let Some(name) = root.file_name().and_then(|n| n.to_str())
+        && let Some(tail) = target.strip_prefix(&format!("{name}!/"))
+    {
+        return tail.to_owned();
+    }
+    target.to_owned()
 }
 
 #[derive(Clone)]

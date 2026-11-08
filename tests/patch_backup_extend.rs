@@ -372,3 +372,14 @@ fn draft_extend_skips_duplicate_targets_from_new_sources() -> Result<()> {
     assert_eq!(merged.entry.len(), 1);
     Ok(())
 }
+
+#[test]
+fn unprefixed_nested_target_keeps_first_segment() {
+    assert_eq!(
+        zipr_lib::archive::strip_root_from_target(
+            std::path::Path::new("app.jar"),
+            "BOOT-INF/lib/foo.jar!/a/B.class"
+        ),
+        "BOOT-INF/lib/foo.jar!/a/B.class"
+    );
+}
