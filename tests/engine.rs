@@ -924,3 +924,14 @@ fn warmed_nested_apply_emits_completed_progress_for_each_phase() {
         );
     }
 }
+
+#[test]
+fn io_error_serialization_keeps_path_and_original_os_message() {
+    let os = std::io::Error::from_raw_os_error(2);
+    let original = os.to_string();
+    let error = EngineError::from(os).with_path("missing.zip");
+    let value = serde_json::to_value(error).unwrap();
+    assert_eq!(value["kind"], "io");
+    assert_eq!(value["paths"][0], "missing.zip");
+    assert!(value["message"].as_str().unwrap().contains(&original));
+}

@@ -14,6 +14,11 @@ use std::{
 };
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    #[error("{path}: {source}")]
+    AtPath {
+        path: PathBuf,
+        source: Box<EngineError>,
+    },
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("invalid archive or plan: {0}")]
@@ -29,14 +34,36 @@ pub enum EngineError {
     #[error("cancelled")]
     Cancelled,
 }
+impl EngineError {
+    pub fn with_path(self, path: impl Into<PathBuf>) -> Self {
+        Self::AtPath {
+            path: path.into(),
+            source: Box::new(self),
+        }
+    }
+}
 impl Serialize for EngineError {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
+        if let Self::AtPath { path, source } = self {
+            let mut value = serde_json::to_value(source).map_err(serde::ser::Error::custom)?;
+            let paths = value
+                .as_object_mut()
+                .ok_or_else(|| serde::ser::Error::custom("error object"))?
+                .entry("paths")
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(paths) = paths.as_array_mut() {
+                paths.push(serde_json::json!(path));
+            }
+            value["message"] = serde_json::json!(self.to_string());
+            return value.serialize(s);
+        }
         let mut v = s.serialize_struct("EngineError", 3)?;
         v.serialize_field(
             "kind",
             match self {
                 Self::Io(_) => "io",
+                Self::AtPath { .. } => "unknown",
                 Self::Invalid(_) => "invalid",
                 Self::SignedJar { .. } => "signed_jar",
                 Self::FileLocked => "file_locked",
@@ -120,7 +147,7 @@ pub struct Source {
 }
 impl Source {
     fn open(p: &Path) -> Result<Self> {
-        let file = File::open(p)?;
+        let file = File::open(p).map_err(|e| EngineError::from(e).with_path(p))?;
         let len = file.metadata()?.len();
         Ok(Self {
             file,
@@ -190,7 +217,9 @@ impl Cache {
         progress: &dyn Progress,
         cancel: &CancelToken,
     ) -> Result<Source> {
-        let root = root.canonicalize()?;
+        let root = root
+            .canonicalize()
+            .map_err(|e| EngineError::from(e).with_path(root))?;
         let meta = fs::metadata(&root)?;
         let mut s = Source::open(&root)?;
         let mut path = Chain::default();
@@ -334,7 +363,7 @@ impl Cache {
     }
     pub fn extract(&self, root: &Path, chain: &Chain, dest: &Path) -> Result<()> {
         let mut s = self.read_entry(root, chain)?;
-        let mut f = File::create(dest)?;
+        let mut f = File::create(dest).map_err(|e| EngineError::from(e).with_path(dest))?;
         splice::copy(&mut s, &mut f, &CancelToken::default())?;
         Ok(())
     }
@@ -499,7 +528,11 @@ pub fn apply(
                 (chain, source)
             }
         };
-        source_bytes = source_bytes.saturating_add(fs::metadata(source)?.len());
+        source_bytes = source_bytes.saturating_add(
+            fs::metadata(source)
+                .map_err(|e| EngineError::from(e).with_path(source))?
+                .len(),
+        );
         targets.push(chain);
     }
     targets.sort();
@@ -544,7 +577,10 @@ pub fn apply(
         if name.starts_with('/') || name.split('/').any(|s| s == "..") {
             return Err(EngineError::Invalid("unsafe entry name".into()));
         }
-        let after = hash(File::open(source)?, cancel)?;
+        let after = hash(
+            File::open(source).map_err(|e| EngineError::from(e).with_path(source))?,
+            cancel,
+        )?;
         for depth in 0..=chain.0.len() {
             let ancestor = Chain(chain.0[..depth].to_vec());
             let mut s = cache.open(&root, &ancestor, progress, cancel)?;
