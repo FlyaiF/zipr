@@ -220,6 +220,7 @@ impl Cache {
                 .map_err(|_| EngineError::Invalid("cache lock".into()))?;
             if let Some(p) = files.get(&key) {
                 s = Source::open(p)?;
+                event(progress, Phase::Inflate, &path, rec.size, rec.size);
                 continue;
             }
             event(progress, Phase::Inflate, &path, 0, rec.size);
@@ -622,6 +623,8 @@ pub fn apply(
             done: 0,
         };
         splice::rewrite(&mut s, &mut writer, &changes, cancel)?;
+        let written = writer.done;
+        event(progress, Phase::Rewrite, &chain, written, written);
         #[cfg(test)]
         CORRUPT_OUTPUT.with(|enabled| {
             if enabled.get() {
@@ -641,6 +644,8 @@ pub fn apply(
         );
         let verify_start = Instant::now();
         verify(&tmp, &changes, cancel)?;
+        let verified = fs::metadata(&tmp)?.len();
+        event(progress, Phase::Verify, &chain, verified, verified);
         *report.durations_ms.entry("verify".into()).or_default() +=
             verify_start.elapsed().as_millis();
         report.rewritten_chains.push(chain.clone());

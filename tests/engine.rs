@@ -629,7 +629,12 @@ fn cache_reuses_inflates_and_remembers_signature_probes() {
         None
     );
     let events = std::cell::Cell::new(0);
-    let p = |_: ProgressEvent| events.set(events.get() + 1);
+    // Cached opens report completion, but must never start another inflate.
+    let p = |event: ProgressEvent| {
+        if event.done == 0 {
+            events.set(events.get() + 1);
+        }
+    };
     cache
         .open(
             &root,
@@ -874,5 +879,48 @@ fn foreign_exclusive_handle_is_locked_but_idle_cache_is_not() {
         drop(exclusive);
         fs::remove_file(&root).unwrap();
         fs::remove_file(report.log_path.unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn warmed_nested_apply_emits_completed_progress_for_each_phase() {
+    use std::cell::RefCell;
+    use zip::CompressionMethod::Deflated;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root.zip");
+    let source = dir.path().join("entry.txt");
+    let inner = archive(&[("entry.txt", b"old", Deflated)]);
+    fs::write(&root, archive(&[("inner.zip", &inner, Deflated)])).unwrap();
+    fs::write(&source, b"replacement").unwrap();
+    let cache = Cache::new().unwrap();
+    cache
+        .list_children(&root, &Chain::from("inner.zip"))
+        .unwrap();
+    let events = RefCell::new(Vec::new());
+    apply(
+        &Plan {
+            root,
+            ops: vec![Op::Replace {
+                target: Chain::from("inner.zip!/entry.txt"),
+                source,
+            }],
+        },
+        &ApplyOptions {
+            backup: false,
+            write_log: false,
+        },
+        &cache,
+        &|event: ProgressEvent| events.borrow_mut().push(event),
+        &CancelToken::default(),
+    )
+    .unwrap();
+    for phase in ["Inflate", "Rewrite", "Verify", "Commit"] {
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|e| format!("{:?}", e.phase) == phase && e.total > 0 && e.done == e.total),
+            "{phase}"
+        );
     }
 }
